@@ -763,3 +763,19 @@ def test_multirotor_takeoff_stays_vertical():
         if d.model != "geoscan_201":
             for s in d.sorties:
                 assert s.legs[0].coordinates[0][:2] == s.legs[0].coordinates[-1][:2]
+
+
+def test_reserve_site_inside_nfz_is_ignored():
+    req = load_req(use_terrain=False)
+    data = req.model_dump()
+    data["reserve_sites"].append({"id": "R9", "name": "", "lon": 37.618, "lat": 55.609})  # внутри NFZ
+    res = plan(PlanRequest(**data))
+    assert any("R9" in w and "запретной зоны" in w for w in res.warnings)
+    assert all(s.divert_site != "R9" for d in res.drones for s in d.sorties)
+
+
+def test_tailwind_trigger_interval_warning():
+    """Камера 801 (мин. интервал 2 с) на попутном галсе при ветре 5 м/с не успевает — предупреждение
+    с фактическим продольным перекрытием."""
+    res = plan(load_req(use_terrain=False))
+    assert any("801-1" in w and "попутном" in w for w in res.warnings)

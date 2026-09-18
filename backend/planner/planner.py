@@ -204,7 +204,16 @@ class Planner:
         self.mode = "strips"
         self.router = Router(self.nfz, req.nfz_buffer_m, self.allowed)
         self.bases = {b.id: f.lonlat_to_xy(b.lon, b.lat) for b in req.bases}
-        self.reserve_sites = {r.id: f.lonlat_to_xy(r.lon, r.lat) for r in req.reserve_sites}
+        self.reserve_sites = {}
+        for r in req.reserve_sites:
+            xy = f.lonlat_to_xy(r.lon, r.lat)
+            pt = Point(xy)
+            if any(z.contains(pt) for z in self.nfz):
+                self.warnings.append(f"резервная площадка {r.id} внутри запретной зоны — не используется")
+            elif self.allowed is not None and not self.allowed.buffer(1.0).contains(pt):
+                self.warnings.append(f"резервная площадка {r.id} вне разрешённой зоны — не используется")
+            else:
+                self.reserve_sites[r.id] = xy
         if not self.bases:
             raise PlanningError("не задано ни одного взлётно-посадочного пункта")
         self.candidates = self._candidates()
@@ -263,6 +272,26 @@ class Planner:
                            f"{wind.speed_ms:.1f} м/с{at_h} (увеличьте GSD или снизьте перекрытие)",
                 ))
                 continue
+            if params.photo_base_m and payload.min_trigger_interval_s:
+                # на попутном галсе путевая скорость больше — кадры чаще; камера может не успеть
+                v_ok = params.photo_base_m / payload.min_trigger_interval_s - wind.speed_ms
+                if (drone.type == "multirotor" and v_ok < params.speed_ms and v_ok >= wind.speed_ms + 2.0):
+                    # мультиротор может лететь медленнее: камера успевает и по ветру, линия пути держится
+                    params = params.model_copy(update={
+                        "speed_ms": v_ok,
+                        "trigger_interval_s": params.photo_base_m / v_ok,
+                        "notes": params.notes + [f"скорость снижена до {v_ok:.1f} м/с: камера успевает и на попутном галсе"],
+                    })
+                gs_tail = params.speed_ms + wind.speed_ms
+                if params.photo_base_m / gs_tail < payload.min_trigger_interval_s - 1e-9:
+                    along = params.photo_base_m / (1 - req.requirements.front_overlap)
+                    real = max(0.0, 1 - payload.min_trigger_interval_s * gs_tail / along)
+                    self.warnings.append(
+                        f"{inst.id}: на попутном галсе камера не успевает (интервал "
+                        f"{params.photo_base_m / gs_tail:.2f} с при минимуме {payload.min_trigger_interval_s:.1f} с) — "
+                        f"продольное перекрытие упадёт до {100 * real:.0f} % вместо "
+                        f"{100 * req.requirements.front_overlap:.0f} %; увеличьте GSD или снизьте перекрытие"
+                    )
             budget = usable_flight_time_s(drone, wind, req.reserve, payload.endurance_factor)
             overhead = params.altitude_agl_m / drone.climb_rate_ms * 2 + (180 if drone.type == "fixed_wing" else 0)
             availability = max(budget - overhead, 1.0) / (budget + drone.swap_time_min * 60)
@@ -873,10 +902,14 @@ class Planner:
         step = 50.0 if r.cand.params.tie_line_spacing_m else 100.0
         out: dict[tuple[int, int], tuple[list, list]] = {}
         base_ground = self._ground(terrain, [self.bases[r.base_id]])[0]
+        worst_agl = 0.0
         for s in r.sorties:
             if r.cand.drone.type == "fixed_wing":
                 all_pts = [p for leg in s.legs for p in self._dense(leg.points, 100.0)]
                 level = max(self._ground(terrain, all_pts) + [base_ground]) + agl
+                survey_pts = [p for leg in s.legs if leg.kind in ("survey", "tie") for p in self._dense(leg.points, 100.0)]
+                if survey_pts:
+                    worst_agl = max(worst_agl, level - min(self._ground(terrain, survey_pts)))
                 for i, leg in enumerate(s.legs):
                     alt = []
                     for k, pt in enumerate(leg.points):
@@ -900,6 +933,16 @@ class Planner:
                 else:
                     level = max(self._ground(terrain, self._dense(leg.points, 100.0))) + agl
                     out[(s.index, i)] = (leg.points, [level] * len(leg.points))
+        if worst_agl > agl * 1.1:
+            # самолёт держит эшелон над высшей точкой рельефа — над низинами он выше заданной высоты
+            p = r.cand.params
+            msg = f"{r.cand.instance_id}: над низинами высота до {worst_agl:.0f} м над землёй вместо {agl:.0f} м"
+            if p.gsd_cm:
+                msg += f", GSD до {p.gsd_cm * worst_agl / agl:.1f} см вместо {p.gsd_cm:.1f}"
+            ceiling = self.req.requirements.altitude_ceiling_m
+            if ceiling is not None and worst_agl > ceiling:
+                msg += f"; выше потолка {ceiling:.0f} м"
+            self.warnings.append(msg + " — разбейте область по высотам рельефа или используйте мультиротор")
         return out
 
     def run(self) -> PlanResponse:
