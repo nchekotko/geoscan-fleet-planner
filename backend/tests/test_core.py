@@ -9,12 +9,12 @@ from fastapi.testclient import TestClient
 from shapely.geometry import LineString, Polygon, box, shape
 
 from api.main import app
-from planner.coverage import best_direction, sweep_passes
+from planner.coverage import best_direction, distinct_directions, sweep_passes
 from planner.dubins import shortest_path
 from planner.energy import usable_flight_time_s
 from planner.fleet import load_fleet
 from planner.mission import SortieBuilder, order_passes
-from planner.planner import plan
+from planner.planner import Planner, plan
 from planner.schemas import PlanRequest
 from planner.sensors import SurveyRequirements, survey_params
 from planner.wind import Wind, ground_speed
@@ -112,6 +112,32 @@ def test_split_is_feasible_and_not_worse_than_greedy():
     assert flown == [[dp.a, dp.b] for dp in route]
     assert b._finish(split) <= b._finish(greedy) + 1e-6
     assert b._finish(b.build(route, (0.0, 0.0), "A")) == min(b._finish(split), b._finish(greedy))
+
+
+def test_distinct_directions_modulo_pi():
+    """Углы, отличающиеся на π или меньше чем на 5°, считаются одним направлением галсов."""
+    a = [0.0, math.pi - 0.01, math.radians(3), math.radians(30), math.pi + math.radians(30.5), 1.0]
+    assert distinct_directions(a, 5) == [0.0, math.radians(30), 1.0]
+    assert distinct_directions(a, 1) == [0.0]
+
+
+@pytest.mark.parametrize("w", [1.0, 0.0])
+def test_angle_multistart_not_worse_than_single(w):
+    """Мультистарт по углу галсов не хуже плана с одним углом (по оценке ведущего борта)
+    и не уменьшает покрытие. На lidar_401 при критерии «налёт» оценка угла ошибается — план
+    заметно лучше; по времени работ выигрыш уже забирает точная нарезка на вылеты (Split)."""
+    data = json.loads((SCENARIO.parent / "lidar_401.json").read_text(encoding="utf-8"))
+    req = PlanRequest(**{**data, "use_terrain": False, "time_weight": w})
+    multi = Planner(req)
+    ev_m, _ = multi.solve()
+    single = Planner(req)
+    single.directions = lambda: Planner.directions(single)[:1]
+    ev_s, _ = single.solve()
+    key = (lambda e: e.makespan) if w == 1.0 else (lambda e: e.total)
+    assert key(ev_m) <= key(ev_s) + 1e-6
+    if w == 0.0:
+        assert key(ev_m) < 0.97 * key(ev_s)
+    assert multi._coverage(ev_m.results) >= single._coverage(ev_s.results) - 1.0
 
 
 # --- планировщик ----------------------------------------------------------------

@@ -8,6 +8,7 @@
    J = w·T_max/T_ref + (1 − w)·ΣT/ΣT_ref.
 6. Для time_weight = 1 — перебор порядка полос бортов одной базы и лексикографическая
    доводка (T_max, затем ΣT), включая ход «убрать борт» с большими накладными расходами.
+7. Шаги 3–6 повторяются для нескольких направлений галсов (мультистарт), берётся лучший план.
 """
 from __future__ import annotations
 
@@ -22,7 +23,14 @@ from shapely.errors import GEOSException
 from shapely.validation import make_valid
 
 from .avoid import Router
-from .coverage import best_direction, sweep_passes
+from .coverage import (
+    best_direction,
+    distinct_directions,
+    ranked_directions,
+    rectangle_axis,
+    sweep_passes,
+    wind_axes,
+)
 from .energy import check_wind, usable_flight_time_s
 from .fleet import DroneModel, Payload, load_fleet
 from .geo import LocalFrame
@@ -47,6 +55,14 @@ from .sensors import SurveyInfeasible, SurveyParams, survey_params
 # Минимальный вес времени работ в критерии «налёт» (w = 0): разрешает почти равные по налёту
 # планы в пользу более быстрого.
 MIN_TIME_WEIGHT = 0.02
+
+# мультистарт по направлению галсов: число углов-кандидатов
+MULTISTART_K = 5
+MULTISTART_K_LARGE = 2
+MULTISTART_LARGE_AREA_M2 = 20e6  # больше 20 км² — план строится секунды, углов меньше
+MULTISTART_MIN_GAIN = 0.005  # другой угол берётся, если выигрыш по J больше 0,5 %
+SCREEN_ITERS = 3  # итераций балансировки при отсеве угла
+COVERAGE_TOL = 1e-5  # покрытие при смене угла не должно падать (допуск — доля площади)
 
 
 class PlanningError(ValueError):
@@ -101,6 +117,16 @@ class Evaluation:
     def uncovered_m2(self) -> float:
         """Площадь, которую план оставляет неснятой (у NFZ и вне радиуса действия)."""
         return self.leftover_m2 + self.unreachable_m2
+
+
+@dataclass
+class _Run:
+    """Готовый план при одном направлении галсов (для мультистарта по углу)."""
+
+    angle: float
+    ev: Evaluation
+    mode: str
+    warnings: list[str]
 
 
 def _polys(g: BaseGeometry) -> BaseGeometry:
@@ -326,7 +352,134 @@ class Planner:
 
     # ---------------------------------------------------------- оптимизация
     def solve(self) -> tuple[Evaluation, float]:
-        cands, angle = self.prepare()
+        """Мультистарт по направлению галсов. Оценка направления по одному борту
+        (best_direction) не видит разбиения на полосы, перелётов и деления на вылеты, поэтому
+        углы сравниваются по планам. Опорный план — полный, с лучшим по оценке углом ведущего
+        борта. Остальные углы проходят дешёвый отсев (несколько итераций балансировки, при
+        w < 1 — ещё планы «всё одному борту»). Быстрый план — допустимый, полный план при
+        том же угле не хуже него, поэтому угол, чей быстрый план уже лучше опорного больше чем
+        на MULTISTART_MIN_GAIN, достраивается полностью и заменяет опорный, если не уменьшает
+        покрытие."""
+        angles = self.directions()
+        ref: _Run | None = None
+        error: ValueError | None = None
+        while angles and ref is None:
+            try:
+                ref = self._full(angles.pop(0))
+            except ValueError as e:
+                error = error or e
+        if ref is None:
+            raise error or PlanningError("не удалось построить план ни для одного направления галсов")
+        for alt in self._promising(ref, angles):
+            try:
+                run = self._full(alt)
+            except ValueError:
+                continue
+            if self._objective_vs(run, ref) < self._objective_vs(ref, ref) and self._covers(run, ref):
+                ref = run
+                break
+        self.mode = ref.mode
+        self.warnings.extend(ref.warnings)
+        return ref.ev, ref.angle
+
+    def _full(self, angle: float) -> _Run:
+        """Полный план при заданном угле; режим разбиения и предупреждения — в результате."""
+        self.mode = "strips"
+        n_warn = len(self.warnings)
+        try:
+            ev = self._solve_at(angle)
+        finally:
+            added = self.warnings[n_warn:]
+            del self.warnings[n_warn:]
+        return _Run(angle, ev, self.mode, added)
+
+    def _objective_vs(self, e: Evaluation | _Run, ref: _Run) -> float:
+        """Целевая функция, нормированная на опорный план."""
+        ev = e.ev if isinstance(e, _Run) else e
+        return self._objective(ev, ref.ev.makespan, ref.ev.total, self.req.time_weight, self.req.makespan_cap_s)
+
+    def _covers(self, run: _Run, ref: _Run) -> bool:
+        """Покрытие планом run не меньше, чем опорным (с допуском COVERAGE_TOL)."""
+        return self._coverage(run.ev.results) >= self._coverage(ref.ev.results) - COVERAGE_TOL * self.area.area
+
+    def _promising(self, ref: _Run, angles: list[float]) -> list[float]:
+        """Углы, чей быстрый план лучше опорного больше чем на MULTISTART_MIN_GAIN,
+        от лучшего к худшему."""
+        limit = self._objective_vs(ref, ref) * (1 - MULTISTART_MIN_GAIN)
+        # если опорному плану не хватило полос (радиус действия), сразу берём сетку
+        modes = ("grid",) if ref.mode == "grid" else ("strips", "grid")
+        scored = []
+        for a in angles:
+            evs = self._screen(a, modes)
+            if evs:
+                j = min(self._objective_vs(e, ref) for e in evs)
+                if j < limit:
+                    scored.append((j, a))
+        return [a for _, a in sorted(scored)]
+
+    def _screen(self, angle: float, modes: tuple[str, ...] = ("strips", "grid")) -> list[Evaluation]:
+        """Быстрые планы для отсева угла: балансировка с малым числом итераций; при w < 1
+        или ε-ограничении — ещё планы, где вся работа у одного борта."""
+        cands = self._order(angle)
+        fr = [c.productivity for c in cands]
+        out: list[Evaluation] = []
+        for mode in modes:
+            self.mode = mode
+            try:
+                out.append(self._balance_from(cands, fr, angle, SCREEN_ITERS))
+                break
+            except (ValueError, GEOSException):
+                continue
+        if not out:
+            return []
+        if (self.req.time_weight < 1.0 or self.req.makespan_cap_s is not None) and len(cands) > 1:
+            for i in range(len(cands)):
+                try:
+                    e = self.evaluate(cands, [1.0 if k == i else 0.0 for k in range(len(cands))], angle)
+                except (ValueError, GEOSException):
+                    continue
+                if e.unreachable_m2 <= out[0].unreachable_m2 + 1.0:
+                    out.append(e)
+        return out
+
+    @staticmethod
+    def _objective(e: Evaluation, t_ref: float, s_ref: float, w: float, cap: float | None) -> float:
+        """J = w·T_max/T_ref + (1 − w)·ΣT/ΣT_ref; при ε-ограничении — min ΣT со штрафом за T_max > ε.
+        При w = 0 время работ всё же входит с весом MIN_TIME_WEIGHT: иначе план с налётом меньше
+        на 1 % может оказаться вдвое дольше (всё — одному борту)."""
+        if cap is not None:
+            w = 0.0
+        else:
+            w = max(w, MIN_TIME_WEIGHT)
+        j = w * e.makespan / t_ref + (1 - w) * e.total / s_ref
+        if cap is not None and e.makespan > cap:
+            j += 10.0 * (e.makespan - cap) / t_ref  # штраф за нарушение ε-ограничения
+        return j
+
+    def directions(self) -> list[float]:
+        """Углы галсов для мультистарта, в порядке приоритета: по два лучших по оценке времени
+        съёмки для каждого набора параметров бортов (первым — ведущий борт), вдоль и поперёк
+        ветра, длинная ось минимального прямоугольника. Близкие (до 5°) углы не повторяются.
+        Для больших областей план строится долго — только два лучших угла ведущего борта."""
+        lead = max(self.candidates, key=lambda c: c.productivity)
+        large = self.area.area > MULTISTART_LARGE_AREA_M2
+        specs: dict[tuple, tuple[float, DroneModel, float]] = {}
+        for c in [lead] + ([] if large else [c for c in self.candidates if c is not lead]):
+            key = (c.drone.id, round(c.params.line_spacing_m, 1), round(c.params.speed_ms, 2))
+            specs.setdefault(key, (c.params.line_spacing_m, c.drone, c.params.speed_ms))
+        ranked = ranked_directions(self.area, list(specs.values()), self.req.wind)
+        if not ranked[0]:
+            raise PlanningError(f"{lead.drone.name}: ветер не позволяет выполнить съёмку ни в одном направлении")
+        angles: list[float] = []
+        for rk in ranked:
+            angles += distinct_directions([a for a, _ in rk], 2)
+        if not large:
+            angles += wind_axes(self.req.wind) + rectangle_axis(self.area)
+        return distinct_directions(angles, MULTISTART_K_LARGE if large else MULTISTART_K)
+
+    def _solve_at(self, angle: float) -> Evaluation:
+        """План при заданном направлении галсов."""
+        cands = self._order(angle)
         fr = [c.productivity for c in cands]
         # Полосы дают лучшую геометрию. Если какой-то борт не достаёт до своей полосы,
         # переходим к разбиению сеткой с учётом радиуса действия.
@@ -349,22 +502,22 @@ class Planner:
             # В сеточном режиме участки растут от баз и от порядка не зависят, а одна оценка
             # стоит ~0,3 с; на large_mixed_fleet доводка ничего не дала — там её не делаем.
             cands, best = self._order_search(cands, best, angle)
-        return best, angle
+        return best
 
     def prepare(self) -> tuple[list[Candidate], float]:
-        """Общее направление галсов и порядок бортов вдоль оси разбиения."""
-        cands = self.candidates
-        # направление галсов — по самому производительному борту
-        lead = max(cands, key=lambda c: c.productivity)
+        """Направление галсов по оценке для самого производительного борта и порядок бортов
+        (одностартовый вариант, используется бенчмарком для простых baseline)."""
+        lead = max(self.candidates, key=lambda c: c.productivity)
         angle, _, _ = best_direction(self.area, lead.params.line_spacing_m, lead.drone, lead.params.speed_ms, self.req.wind)
+        return self._order(angle), angle
 
-        # порядок полос ↔ положение баз вдоль оси, перпендикулярной галсам
+    def _order(self, angle: float) -> list[Candidate]:
+        """Порядок полос ↔ положение баз вдоль оси, перпендикулярной галсам."""
         def axis_key(c: Candidate) -> float:
             b = self.bases[c.base_id or self._default_base(self.area)]
             return strip_axis_position(b, angle)
 
-        cands.sort(key=axis_key)
-        return cands, angle
+        return sorted(self.candidates, key=axis_key)
 
     def _base_of(self, c: Candidate) -> str:
         return c.base_id or self._default_base(self.area)
@@ -486,18 +639,11 @@ class Planner:
         t_ref, s_ref = start.makespan, start.total
         area = self.area.area
         lexi = w >= 1.0 and cap is None
-        if cap is None:
-            # При w = 0 время работ всё же учитываем с малым весом: иначе план с налётом
-            # меньше на 1 % может оказаться вдвое дольше (всё — одному борту).
-            w = max(w, MIN_TIME_WEIGHT)
 
         def score(e: Evaluation) -> float:
-            j = w * e.makespan / t_ref + (1 - w) * e.total / s_ref
-            if cap is not None and e.makespan > cap:
-                j += 10.0 * (e.makespan - cap) / t_ref  # штраф за нарушение ε-ограничения
             # полнота съёмки — жёсткое требование: доля неснятой площади штрафуется сильнее,
             # чем любое реальное изменение времени (метод штрафных функций, Coello, 2002)
-            return j + UNCOVERED_PENALTY * e.uncovered_m2 / area
+            return self._objective(e, t_ref, s_ref, w, cap) + UNCOVERED_PENALTY * e.uncovered_m2 / area
 
         def loses_coverage(a: Evaluation, b: Evaluation) -> bool:
             return a.uncovered_m2 > b.uncovered_m2 + UNCOVERED_TOL_M2
