@@ -279,6 +279,19 @@ def test_pareto_front_is_non_dominated():
         assert a.summary.total_flight_s > b.summary.total_flight_s
 
 
+def test_time_plan_not_dominated_by_pareto_front():
+    """План при w = 1 не хуже ни одной точки фронта сразу по обоим критериям."""
+    from planner.pareto import pareto_front
+    req = load_req(use_terrain=False)
+    t = plan(req.model_copy(update={"time_weight": 1.0})).summary
+    # перебор порядка бортов базы B: 801 ближе к базе → 57,1 мин (без перебора было 58,7)
+    assert t.makespan_s <= 58.2 * 60
+    for p in pareto_front(req, weights=(1.0, 0.5, 0.0), workers=1):
+        s = p.summary
+        assert not (s.makespan_s < t.makespan_s - 1.0 and s.total_flight_s < t.total_flight_s - 1.0)
+        assert s.makespan_s >= t.makespan_s - 1.0  # быстрее плана «время работ» во фронте нет
+
+
 def test_api_pareto():
     c = TestClient(app)
     body = json.loads((SCENARIO.parent / "strong_wind.json").read_text(encoding="utf-8"))

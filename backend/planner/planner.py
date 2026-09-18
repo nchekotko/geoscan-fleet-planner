@@ -6,9 +6,12 @@
 4. Балансировка долей по фактическому времени (критерий «время работ»).
 5. Для time_weight < 1 — локальный поиск по долям, минимизирующий
    J = w·T_max/T_ref + (1 − w)·ΣT/ΣT_ref.
+6. Для time_weight = 1 — перебор порядка полос бортов одной базы и лексикографическая
+   доводка (T_max, затем ΣT), включая ход «убрать борт» с большими накладными расходами.
 """
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass
 
@@ -299,6 +302,12 @@ class Planner:
             best = self._local_search(cands, best, angle, 0.0, cap=cap)
         elif w < 1.0 and len(cands) > 1:
             best = self._local_search(cands, best, angle, w)
+        elif len(cands) > 1 and self.mode != "grid":
+            # w = 1: сначала порядок бортов одной базы, затем доводка долей.
+            # В сеточном режиме участки растут от баз и от порядка не зависят, а одна оценка
+            # стоит ~0,3 с; на large_mixed_fleet доводка ничего не дала — там её не делаем.
+            cands, best = self._order_search(cands, best, angle)
+            best = self._local_search(cands, best, angle, 1.0)
         return best, angle
 
     def prepare(self) -> tuple[list[Candidate], float]:
@@ -315,6 +324,70 @@ class Planner:
 
         cands.sort(key=axis_key)
         return cands, angle
+
+    def _base_of(self, c: Candidate) -> str:
+        return c.base_id or self._default_base(self.area)
+
+    def _orders(self, cands: list[Candidate], limit: int = 24) -> list[list[Candidate]]:
+        """Другие порядки полос, не меняющие положения баз вдоль оси: перестановки внутри
+        групп бортов одной базы. Одинаковые борта (модель + нагрузка) не различаются.
+        Если перестановок больше limit — только обмены соседей внутри группы (2-opt)."""
+        groups: list[list[Candidate]] = []
+        for c in cands:
+            if groups and self._base_of(groups[-1][-1]) == self._base_of(c):
+                groups[-1].append(c)
+            else:
+                groups.append([c])
+        total = math.prod(math.factorial(len(g)) for g in groups)
+        if total <= limit:
+            variants = [list(itertools.permutations(g)) for g in groups]
+            orders = [[c for g in combo for c in g] for combo in itertools.product(*variants)]
+        else:
+            orders = []
+            for k in range(len(cands) - 1):
+                if self._base_of(cands[k]) == self._base_of(cands[k + 1]):
+                    o = list(cands)
+                    o[k], o[k + 1] = o[k + 1], o[k]
+                    orders.append(o)
+
+        def key(order: list[Candidate]) -> tuple:
+            return tuple((c.drone.id, c.payload.id) for c in order)
+
+        seen = {key(cands)}
+        out = []
+        for o in orders:
+            if key(o) not in seen:
+                seen.add(key(o))
+                out.append(o)
+        return out
+
+    @staticmethod
+    def _lexi_better(a: Evaluation, b: Evaluation, tol: float = 0.005) -> bool:
+        """Лексикографическое сравнение для w = 1: главное — T_max, налёт — вторичный критерий.
+        План a лучше b, если T_max меньше более чем на tol (0,5 %), либо a доминирует b по Парето
+        (T_max не больше и ΣT не больше, хотя бы одно строго). Допуск не даёт выиграть секунды
+        T_max ценой минут налёта: такая разница меньше точности модели времени."""
+        if a.makespan < b.makespan * (1 - tol):
+            return True
+        return (a.makespan <= b.makespan and a.total <= b.total
+                and (a.makespan < b.makespan - 1.0 or a.total < b.total - 1.0))
+
+    def _order_search(
+        self, cands: list[Candidate], best: Evaluation, angle: float
+    ) -> tuple[list[Candidate], Evaluation]:
+        """Перебор порядка полос внутри групп бортов одной базы (только полосное разбиение):
+        от порядка зависит, чья полоса ближе к базе, а значит и перелёты. Каждый порядок
+        балансируется заново (один старт — доли по производительности)."""
+        for order in self._orders(cands):
+            try:
+                e = self._balance_from(order, [c.productivity for c in order], angle, 12)
+            except (ValueError, GEOSException):
+                continue
+            if e.unreachable_m2 > best.unreachable_m2 + 1.0 or e.leftover_m2 > best.leftover_m2 + 1.0:
+                continue
+            if self._lexi_better(e, best):
+                cands, best = order, e
+        return cands, best
 
     def _balance(self, cands: list[Candidate], fr: list[float], angle: float, iters: int = 12) -> Evaluation:
         """Выравнивание времени окончания работ: доли корректируются по фактическому времени.
@@ -357,6 +430,7 @@ class Planner:
         self, cands: list[Candidate], start: Evaluation, angle: float, w: float, cap: float | None = None
     ) -> Evaluation:
         t_ref, s_ref = start.makespan, start.total
+        lexi = w >= 1.0 and cap is None
 
         def score(e: Evaluation) -> float:
             j = w * e.makespan / t_ref + (1 - w) * e.total / s_ref
@@ -364,22 +438,35 @@ class Planner:
                 j += 10.0 * (e.makespan - cap) / t_ref  # штраф за нарушение ε-ограничения
             return j
 
-        best, best_j = start, score(start)
-        # дополнительные стартовые точки: вся работа одному борту
-        for i in range(len(cands)):
-            fr = [1.0 if k == i else 0.0 for k in range(len(cands))]
-            try:
-                e = self.evaluate(cands, fr, angle)
-            except (ValueError, GEOSException):
-                continue
-            if e.unreachable_m2 > best.unreachable_m2 + 1.0:
-                continue  # один борт не достаёт до всей области — не считаем решением
-            if score(e) < best_j - 1e-6:
-                best, best_j = e, score(e)
+        def better(a: Evaluation, b: Evaluation) -> bool:
+            return self._lexi_better(a, b) if lexi else score(a) < score(b) - 1e-6
+
+        best = start
+        if lexi:
+            # один борт на всю область по T_max заведомо хуже — вместо этого пробуем убрать борт
+            e = self._drop_overhead_drone(cands, best, angle, better)
+            if e is not None and better(e, best):
+                best = e
+        else:
+            # дополнительные стартовые точки: вся работа одному борту
+            for i in range(len(cands)):
+                fr = [1.0 if k == i else 0.0 for k in range(len(cands))]
+                try:
+                    e = self.evaluate(cands, fr, angle)
+                except (ValueError, GEOSException):
+                    continue
+                if e.unreachable_m2 > best.unreachable_m2 + 1.0:
+                    continue  # один борт не достаёт до всей области — не считаем решением
+                if better(e, best):
+                    best = e
         n = len(cands)
-        step = 0.5
+        # при w = 1 доли уже выровнены балансировкой — начинаем с мелкого шага
+        step = 0.2 if lexi else 0.5
         evals = 0
-        max_evals = 16 if self.mode == "grid" else 200
+        if lexi:
+            max_evals = 12  # один проход шагом 0,2: на тестовых сценариях дальше улучшений нет
+        else:
+            max_evals = 16 if self.mode == "grid" else 200
         while step > 0.05 and evals < max_evals:
             improved = False
             for i in range(n):
@@ -398,11 +485,40 @@ class Planner:
                     except (ValueError, GEOSException):
                         continue
                     evals += 1
-                    j_val = score(e)
-                    if j_val < best_j - 1e-6:
-                        best, best_j, improved = e, j_val, True
+                    if better(e, best):
+                        best, improved = e, True
             if not improved:
                 step /= 2
+        return best
+
+    def _drop_overhead_drone(self, cands: list[Candidate], cur: Evaluation, angle: float, better) -> Evaluation | None:
+        """Ход «убрать борт»: если время борта в основном уходит на накладные расходы
+        (взлёт, набор высоты, перелёт, посадка), а не на съёмку, его участок отдаём остальным
+        и заново балансируем доли. Возвращает лучший из таких планов или None."""
+        survey_kinds = ("survey", "tie")
+        by_id = {r.cand.instance_id: r for r in cur.results}
+        best = None
+        for i, c in enumerate(cands):
+            r = by_id.get(c.instance_id)
+            if r is None or len(cur.results) < 2:
+                continue
+            survey_s = sum(l.duration_s for s in r.sorties for l in s.legs if l.kind in survey_kinds)
+            if survey_s >= 0.5 * r.finish_s:
+                continue
+            keep = [k for k in range(len(cands)) if k != i and cur.fractions[k] > 1e-6]
+            sub = [cands[k] for k in keep]
+            try:
+                e = self._balance_from(sub, [cur.fractions[k] for k in keep], angle, 2 if self.mode == "grid" else 6)
+            except (ValueError, GEOSException):
+                continue
+            if e.unreachable_m2 > cur.unreachable_m2 + 1.0 or e.leftover_m2 > cur.leftover_m2 + 1.0:
+                continue
+            full = [0.0] * len(cands)
+            for k, f in zip(keep, e.fractions):
+                full[k] = f
+            e.fractions = full
+            if best is None or better(e, best):
+                best = e
         return best
 
     # ------------------------------------------------------------ вывод
