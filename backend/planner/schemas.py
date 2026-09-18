@@ -49,6 +49,9 @@ class LegOut(BaseModel):
     alt_amsl: list[float] | None = None  # абсолютная высота точек (EGM2008), если есть рельеф
     duration_s: float
     distance_m: float
+    # скорость на участке, м/с: съёмочная (survey, tie, turn), транзитная (transit, return),
+    # вертикальная — набор высоты (takeoff) и средняя скорость снижения (landing)
+    speed_ms: float = 0.0
 
 
 class SortieOut(BaseModel):
@@ -106,4 +109,7 @@ class PlanResponse(BaseModel):
     time_weight: float
     reserve_sites: list[Site] = Field(default_factory=list)
     bases: list[Site] = Field(default_factory=list)
+    # ограничения из запроса — для экспорта заданий
+    no_fly_zones: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_area: dict[str, Any] | None = None
     terrain: TerrainInfo | None = None

@@ -24,13 +24,17 @@ MULTIROTOR_DESCENT_MS = 3.0
 
 @dataclass
 class Leg:
-    """Участок маршрута. kind: takeoff | transit | survey | turn | return | landing."""
+    """Участок маршрута. kind: takeoff | transit | survey | tie | turn | return | landing.
+
+    speed_ms — скорость на участке: съёмочная на галсах и разворотах, транзитная на перелётах
+    и возврате, вертикальная (набор высоты / снижение) на взлёте и посадке."""
 
     kind: str
     points: list[tuple[float, float]]
     alt_agl: float
     duration_s: float
     distance_m: float
+    speed_ms: float = 0.0
 
 
 @dataclass
@@ -194,6 +198,13 @@ class SortieBuilder:
             return FIXED_WING_LANDING_S
         return self.alt / MULTIROTOR_DESCENT_MS
 
+    def descent_ms(self) -> float:
+        """Средняя вертикальная скорость посадки (у самолёта — заход и спуск на парашюте)."""
+        return self.alt / self.landing_s() if self.drone.type == "fixed_wing" else MULTIROTOR_DESCENT_MS
+
+    def leg_speed(self, kind: str) -> float:
+        return self.transit_speed if kind in ("transit", "return") else self.speed
+
     def return_s(self, p: tuple[float, float], base: tuple[float, float]) -> float:
         return self.path_time(self.path(p, base), self.transit_speed) + self.landing_s()
 
@@ -206,7 +217,7 @@ class SortieBuilder:
         while queue:
             s = Sortie(index=len(sorties), base=base, base_id=base_id)
             t = self.takeoff_s()
-            s.legs.append(Leg("takeoff", [base, base], self.alt, t, 0.0))
+            s.legs.append(Leg("takeoff", [base, base], self.alt, t, 0.0, self.drone.climb_rate_ms))
             pos, heading = base, None
             added = 0
             while queue:
@@ -214,8 +225,8 @@ class SortieBuilder:
                 app_kind, app_pts, app_t, app_len = self.approach(pos, heading, dp)
                 pass_t = self.fly_time(dp.a, dp.b, self.speed)
                 if t + app_t + pass_t + self.return_s(dp.b, base) <= self.budget:
-                    s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len))
-                    s.legs.append(Leg(dp.kind, [dp.a, dp.b], self.alt, pass_t, dp.length))
+                    s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len, self.leg_speed(app_kind)))
+                    s.legs.append(Leg(dp.kind, [dp.a, dp.b], self.alt, pass_t, dp.length, self.speed))
                     t += app_t + pass_t
                     pos, heading = dp.b, dp.heading
                     queue.pop(0)
@@ -226,8 +237,8 @@ class SortieBuilder:
                 if frac * dp.length >= 20.0:
                     cut = (dp.a[0] + frac * (dp.b[0] - dp.a[0]), dp.a[1] + frac * (dp.b[1] - dp.a[1]))
                     part_t = self.fly_time(dp.a, cut, self.speed)
-                    s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len))
-                    s.legs.append(Leg(dp.kind, [dp.a, cut], self.alt, part_t, math.dist(dp.a, cut)))
+                    s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len, self.leg_speed(app_kind)))
+                    s.legs.append(Leg(dp.kind, [dp.a, cut], self.alt, part_t, math.dist(dp.a, cut), self.speed))
                     t += app_t + part_t
                     pos, heading = cut, dp.heading
                     queue[0] = DirectedPass(cut, dp.b, dp.kind)
@@ -239,8 +250,8 @@ class SortieBuilder:
                 )
             back = self.path(pos, base)
             back_t = self.path_time(back, self.transit_speed)
-            s.legs.append(Leg("return", back, self.alt, back_t, _plen(back)))
-            s.legs.append(Leg("landing", [base, base], self.alt, self.landing_s(), 0.0))
+            s.legs.append(Leg("return", back, self.alt, back_t, _plen(back), self.transit_speed))
+            s.legs.append(Leg("landing", [base, base], self.alt, self.landing_s(), 0.0, self.descent_ms()))
             sorties.append(s)
         return sorties
 
