@@ -6,13 +6,17 @@ J = w·T_max/T_ref + (1 − w)·ΣT/ΣT_ref (метод взвешенной с�
 """
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 from shapely.geometry import shape
 
 from .geo import LocalFrame
 from .planner import plan
 from .schemas import PlanRequest, PlanResponse
+
+log = logging.getLogger("geoscan.pareto")
 
 DEFAULT_WEIGHTS = (1.0, 0.9, 0.75, 0.6, 0.45, 0.3, 0.15, 0.0)
 LARGE_AREA_KM2 = 20.0
@@ -56,8 +60,13 @@ def non_dominated(plans: list[PlanResponse]) -> list[PlanResponse]:
 def _run(jobs, workers):
     if workers == 1:
         return [_solve(j) for j in jobs]
-    with ProcessPoolExecutor(max_workers=workers or min(len(jobs), 6)) as ex:
-        return list(ex.map(_solve, jobs))
+    try:
+        with ProcessPoolExecutor(max_workers=workers or min(len(jobs), 6)) as ex:
+            return list(ex.map(_solve, jobs))
+    except (BrokenProcessPool, OSError):
+        # пул процессов недоступен (нехватка памяти, ограничения среды) — считаем последовательно
+        log.warning("пул процессов недоступен, фронт Парето считается последовательно")
+        return [_solve(j) for j in jobs]
 
 
 def pareto_front(

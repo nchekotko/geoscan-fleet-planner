@@ -577,3 +577,23 @@ def test_every_leg_has_speed(name):
         for s in d.sorties:
             for leg in s.legs:
                 assert leg.speed_ms > 0, (d.drone_id, s.index, leg.kind)
+
+
+def test_pareto_survives_broken_pool(monkeypatch):
+    """Если пул процессов упал, фронт Парето досчитывается последовательно."""
+    import planner.pareto as pr
+    from concurrent.futures.process import BrokenProcessPool
+
+    class Broken:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            raise BrokenProcessPool("тест")
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(pr, "ProcessPoolExecutor", Broken)
+    front = pr.pareto_front(scenario("strong_wind", use_terrain=False), weights=(1.0, 0.0), eps_points=0)
+    assert front
