@@ -13,6 +13,7 @@ from planner.coverage import best_direction, sweep_passes
 from planner.dubins import shortest_path
 from planner.energy import usable_flight_time_s
 from planner.fleet import load_fleet
+from planner.mission import SortieBuilder, order_passes
 from planner.planner import plan
 from planner.schemas import PlanRequest
 from planner.sensors import SurveyRequirements, survey_params
@@ -93,6 +94,24 @@ def test_direction_follows_long_side():
     area = box(0, 0, 3000, 300)
     ang, _, _ = best_direction(area, 50, FLEET.drones["geoscan_gemini"], 10, Wind())
     assert min(ang % math.pi, math.pi - ang % math.pi) < 0.05
+
+
+# --- нарезка на вылеты -----------------------------------------------------------
+def test_split_is_feasible_and_not_worse_than_greedy():
+    """Точная нарезка (Split): все вылеты в бюджете, галсы сняты целиком и по порядку,
+    время работы борта не больше, чем у жадной нарезки."""
+    d = FLEET.drones["geoscan_gemini"]
+    area = box(2000, -1500, 4500, 1500)
+    route = order_passes(sweep_passes(area, 0.3, 60), (0.0, 0.0))
+    b = SortieBuilder(d, 10.0, 100.0, Wind(speed_ms=5, from_deg=200), 25 * 60)
+    split = b._build_split(route, (0.0, 0.0), "A")
+    greedy = b._build_greedy(route, (0.0, 0.0), "A")
+    assert split is not None and len(split) > 1
+    assert all(s.duration_s <= b.budget + 1e-6 for s in split)
+    flown = [leg.points for s in split for leg in s.legs if leg.kind == "survey"]
+    assert flown == [[dp.a, dp.b] for dp in route]
+    assert b._finish(split) <= b._finish(greedy) + 1e-6
+    assert b._finish(b.build(route, (0.0, 0.0), "A")) == min(b._finish(split), b._finish(greedy))
 
 
 # --- планировщик ----------------------------------------------------------------
@@ -294,8 +313,8 @@ def test_time_plan_not_dominated_by_pareto_front():
     from planner.pareto import pareto_front
     req = load_req(use_terrain=False)
     t = plan(req.model_copy(update={"time_weight": 1.0})).summary
-    # перебор порядка бортов базы B: 801 ближе к базе → 57,1 мин (без перебора было 58,7)
-    assert t.makespan_s <= 58.2 * 60
+    # перебор порядка бортов базы B с доводкой: 58,4 мин и налёт 190 мин (без перебора 58,7 / 202)
+    assert t.makespan_s <= 58.5 * 60 and t.total_flight_s <= 195 * 60
     for p in pareto_front(req, weights=(1.0, 0.5, 0.0), workers=1):
         s = p.summary
         assert not (s.makespan_s < t.makespan_s - 1.0 and s.total_flight_s < t.total_flight_s - 1.0)

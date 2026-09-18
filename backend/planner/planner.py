@@ -44,6 +44,10 @@ from .schemas import (
 )
 from .sensors import SurveyInfeasible, SurveyParams, survey_params
 
+# Минимальный вес времени работ в критерии «налёт» (w = 0): разрешает почти равные по налёту
+# планы в пользу более быстрого.
+MIN_TIME_WEIGHT = 0.02
+
 
 class PlanningError(ValueError):
     pass
@@ -331,7 +335,6 @@ class Planner:
             # В сеточном режиме участки растут от баз и от порядка не зависят, а одна оценка
             # стоит ~0,3 с; на large_mixed_fleet доводка ничего не дала — там её не делаем.
             cands, best = self._order_search(cands, best, angle)
-            best = self._local_search(cands, best, angle, 1.0)
         return best, angle
 
     def prepare(self) -> tuple[list[Candidate], float]:
@@ -401,17 +404,22 @@ class Planner:
     ) -> tuple[list[Candidate], Evaluation]:
         """Перебор порядка полос внутри групп бортов одной базы (только полосное разбиение):
         от порядка зависит, чья полоса ближе к базе, а значит и перелёты. Каждый порядок
-        балансируется заново (один старт — доли по производительности)."""
+        проходит ту же балансировку и доводку, что и исходный: после точной нарезки (Split)
+        время борта меняется ступенями, и одной балансировки для сравнения порядков мало."""
+        start = best
+        best = self._local_search(cands, best, angle, 1.0, quick=True)
         for order in self._orders(cands):
             try:
                 e = self._balance_from(order, [c.productivity for c in order], angle, 12)
+                e = self._local_search(order, e, angle, 1.0, quick=True)
             except (ValueError, GEOSException):
                 continue
             if e.unreachable_m2 > best.unreachable_m2 + 1.0 or e.leftover_m2 > best.leftover_m2 + 1.0:
                 continue
             if self._lexi_better(e, best):
-                cands, best = order, e
-        return cands, best
+                cands, best, start = order, e, e
+        # широкий поиск — только для лучшего порядка
+        return cands, self._local_search(cands, start if start is not best else best, angle, 1.0)
 
     def _balance(self, cands: list[Candidate], fr: list[float], angle: float, iters: int = 12) -> Evaluation:
         """Выравнивание времени окончания работ: доли корректируются по фактическому времени.
@@ -453,11 +461,17 @@ class Planner:
         return best
 
     def _local_search(
-        self, cands: list[Candidate], start: Evaluation, angle: float, w: float, cap: float | None = None
+        self, cands: list[Candidate], start: Evaluation, angle: float, w: float, cap: float | None = None,
+        quick: bool = False,
     ) -> Evaluation:
+        """quick — короткий проход (шаг 0,2, до 12 оценок) для сравнения вариантов между собой."""
         t_ref, s_ref = start.makespan, start.total
         area = self.area.area
         lexi = w >= 1.0 and cap is None
+        if cap is None:
+            # При w = 0 время работ всё же учитываем с малым весом: иначе план с налётом
+            # меньше на 1 % может оказаться вдвое дольше (всё — одному борту).
+            w = max(w, MIN_TIME_WEIGHT)
 
         def score(e: Evaluation) -> float:
             j = w * e.makespan / t_ref + (1 - w) * e.total / s_ref
@@ -481,7 +495,7 @@ class Planner:
         best = start
         if lexi:
             # один борт на всю область по T_max заведомо хуже — вместо этого пробуем убрать борт
-            e = self._drop_overhead_drone(cands, best, angle, better)
+            e = None if quick else self._drop_overhead_drone(cands, best, angle, better)
             if e is not None and better(e, best):
                 best = e
         else:
@@ -495,13 +509,15 @@ class Planner:
                 if better(e, best):  # один борт, не снимающий всю область, сюда не пройдёт
                     best = e
         n = len(cands)
-        # при w = 1 доли уже выровнены балансировкой — начинаем с мелкого шага
-        step = 0.2 if lexi else 0.5
+        step = 0.2 if quick else 0.5
         evals = 0
-        if lexi:
-            max_evals = 12  # один проход шагом 0,2: на тестовых сценариях дальше улучшений нет
+        if quick:
+            max_evals = 12
+        elif self.mode == "grid":
+            max_evals = 16
         else:
-            max_evals = 16 if self.mode == "grid" else 200
+            # при w = 1 лексикографика принимает и мелкие выигрыши по налёту — ограничиваем
+            max_evals = 40 if lexi else 200
         while step > 0.05 and evals < max_evals:
             improved = False
             for i in range(n):
