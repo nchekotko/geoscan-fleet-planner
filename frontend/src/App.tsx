@@ -1,8 +1,21 @@
 import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 import MapView, { DRONE_COLORS, type DrawMode } from './MapView'
-import { api, type Fleet, type PlanRequest, type PlanResponse, type SurveyType } from './api'
+import { api, ApiError, type Fleet, type PlanRequest, type PlanResponse, type SurveyType } from './api'
 import { Gantt, ParetoChart } from './charts'
+import {
+  COVERAGE_OK_PCT,
+  criterionLabel,
+  droneIdErrors,
+  formatCoverage,
+  isEpsilonPlan,
+  nextBaseId,
+  nextDroneId,
+  nextFreeId,
+  requestKey,
+  type Criterion,
+  type ExcludedInfo,
+} from './logic'
 
 const SURVEY_TYPES: { id: SurveyType; label: string }[] = [
   { id: 'rgb', label: 'RGB' },
@@ -37,6 +50,35 @@ const DRAW_BUTTONS: { mode: Exclude<DrawMode, null>; label: string }[] = [
 
 const min = (s: number) => `${(s / 60).toFixed(1)} мин`
 
+/** По каким входным данным и с каким критерием построен показанный результат. */
+interface Shown {
+  key: string
+  weight: number // положение ползунка на момент расчёта/выбора точки
+  criterion: Criterion
+}
+
+interface UiError {
+  message: string
+  items: string[]
+  excluded: ExcludedInfo[]
+}
+
+const toUiError = (e: unknown): UiError =>
+  e instanceof ApiError
+    ? { message: e.message, items: e.items, excluded: e.excluded }
+    : { message: (e as Error).message, items: [], excluded: [] }
+
+/** Ссылка экспорта; у устаревшего плана — неактивна. */
+function ExportLink({ href, stale, className, children }: { href: string; stale: boolean; className?: string; children: string }) {
+  if (stale)
+    return (
+      <span className={`${className ?? ''} disabled`} aria-disabled="true" title="План устарел — пересчитайте">
+        {children}
+      </span>
+    )
+  return <a className={className} href={href}>{children}</a>
+}
+
 export default function App() {
   const [req, setReq] = useState<PlanRequest>(EMPTY)
   const [fleet, setFleet] = useState<Fleet | null>(null)
@@ -44,10 +86,21 @@ export default function App() {
   const [plan, setPlan] = useState<PlanResponse | null>(null)
   const [drawMode, setDrawMode] = useState<DrawMode>(null)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<UiError | null>(null)
   const [fitKey, setFitKey] = useState(0)
   const [front, setFront] = useState<PlanResponse[] | null>(null)
   const [paretoBusy, setParetoBusy] = useState(false)
+  const [shown, setShown] = useState<Shown | null>(null)
+  const [elapsed, setElapsed] = useState(0)
+  const computing = busy || paretoBusy
+
+  // секундомер для долгих расчётов (фронт Парето — 10–15 с)
+  useEffect(() => {
+    if (!computing) return
+    const t0 = Date.now()
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 250)
+    return () => clearInterval(t)
+  }, [computing])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setDrawMode(null)
@@ -56,7 +109,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    api.fleet().then(setFleet).catch((e) => setError(`API недоступен: ${e.message}`))
+    api.fleet().then(setFleet).catch((e) => setError({ message: `API недоступен: ${e.message}`, items: [], excluded: [] }))
     api.scenarios().then(setScenarios).catch(() => {})
   }, [])
 
@@ -66,13 +119,13 @@ export default function App() {
     setReq({ ...EMPTY, ...s, requirements: { ...EMPTY.requirements, ...s.requirements } })
     setPlan(null)
     setFront(null)
+    setShown(null)
+    setError(null)
     setFitKey((k) => k + 1)
   }
 
   const onDrawn = (mode: Exclude<DrawMode, null>, g: GeoJSON.Polygon | { lon: number; lat: number }) => {
     setDrawMode(null)
-    setPlan(null)
-    setFront(null)
     setReq((r) => {
       if ('type' in g) {
         if (mode === 'survey') return { ...r, survey_area: g }
@@ -80,51 +133,77 @@ export default function App() {
         return { ...r, no_fly_zones: [...r.no_fly_zones, g] }
       }
       if (mode === 'base') {
-        const id = String.fromCharCode(65 + r.bases.length)
+        const id = nextBaseId(r.bases.map((b) => b.id))
         return { ...r, bases: [...r.bases, { id, name: '', ...g }] }
       }
-      return { ...r, reserve_sites: [...r.reserve_sites, { id: `R${r.reserve_sites.length + 1}`, ...g }] }
+      return { ...r, reserve_sites: [...r.reserve_sites, { id: nextFreeId('R', r.reserve_sites.map((s) => s.id)), ...g }] }
     })
   }
 
   const addDrone = (model: string) => {
     if (!model) return
     setReq((r) => {
-      const n = r.drones.filter((d) => d.model === model).length + 1
-      const short = model.replace('geoscan_', '')
-      return { ...r, drones: [...r.drones, { id: `${short}-${n}`, model, base_id: r.bases[0]?.id ?? null }] }
+      const id = nextDroneId(model, r.drones)
+      return { ...r, drones: [...r.drones, { id, model, base_id: r.bases[0]?.id ?? null }] }
     })
   }
 
   const run = async () => {
+    const snapshot = req
+    setElapsed(0)
     setBusy(true)
     setError(null)
     try {
-      setPlan(await api.plan(req))
+      const p = await api.plan(snapshot)
+      setPlan(p)
+      setFront(null)
+      setShown({ key: requestKey(snapshot), weight: snapshot.time_weight, criterion: { kind: 'weighted', w: p.time_weight } })
     } catch (e) {
-      setError((e as Error).message)
+      setError(toUiError(e))
       setPlan(null)
+      setShown(null)
     } finally {
       setBusy(false)
     }
   }
 
+  // выбор точки фронта: план не устаревает, ползунок встаёт на вес плана (для ε-плана — не трогаем)
+  const selectFrontPlan = (p: PlanResponse, f: PlanResponse[], key: string, weightNow: number) => {
+    const eps = isEpsilonPlan(p, f)
+    const w = eps ? weightNow : p.time_weight
+    setPlan(p)
+    setShown({ key, weight: w, criterion: { kind: 'front', w: eps ? null : p.time_weight } })
+    if (!eps) setReq((r) => ({ ...r, time_weight: p.time_weight }))
+  }
+
   const runPareto = async () => {
+    const snapshot = req
+    setElapsed(0)
     setParetoBusy(true)
     setError(null)
     try {
-      const f = await api.pareto(req)
+      const f = await api.pareto(snapshot)
       setFront(f)
       // по умолчанию показываем самый быстрый план фронта
-      setPlan(f[0] ?? null)
+      if (f[0]) selectFrontPlan(f[0], f, requestKey(snapshot), snapshot.time_weight)
+      else {
+        setPlan(null)
+        setShown(null)
+      }
     } catch (e) {
-      setError((e as Error).message)
+      setError(toUiError(e))
     } finally {
       setParetoBusy(false)
     }
   }
 
-  const canRun = req.survey_area && req.bases.length > 0 && req.drones.length > 0 && !busy
+  const idErrors = useMemo(() => droneIdErrors(req.drones), [req.drones])
+  const hasIdErrors = Object.keys(idErrors).length > 0
+  const currentKey = useMemo(() => requestKey(req), [req])
+  const stale = !!shown && (shown.key !== currentKey || shown.weight !== req.time_weight)
+  const frontStale = !!shown && shown.key !== currentKey
+  const epsSelected = shown?.criterion.kind === 'front' && shown.criterion.w === null && !stale
+  const canRun = req.survey_area && req.bases.length > 0 && req.drones.length > 0 && !hasIdErrors && !computing
   const setReqField = <K extends keyof PlanRequest['requirements']>(k: K, v: PlanRequest['requirements'][K]) =>
     setReq((r) => ({ ...r, requirements: { ...r.requirements, [k]: v } }))
 
@@ -197,7 +276,7 @@ export default function App() {
                 <button className="link" onClick={() => setReq({ ...req, reserve_sites: req.reserve_sites.filter((_, j) => j !== i) })}>✕</button>
               </span>
             ))}
-            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null); setFront(null) }}>
+            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null); setFront(null); setShown(null); setError(null) }}>
               очистить всё
             </button>
           </div>
@@ -206,10 +285,12 @@ export default function App() {
         <section>
           <h2>Парк</h2>
           {req.drones.map((d, i) => (
-            <div className="row" key={i}>
+            <div className="drone" key={i}>
+            <div className="row">
               <span className="swatch" style={{ background: droneColor[d.id] ?? '#ccc' }} />
               <input
-                className="id"
+                className={idErrors[i] ? 'id invalid' : 'id'}
+                aria-invalid={!!idErrors[i]}
                 value={d.id}
                 onChange={(e) =>
                   setReq((r) => ({ ...r, drones: r.drones.map((x, j) => (j === i ? { ...x, id: e.target.value } : x)) }))
@@ -235,6 +316,8 @@ export default function App() {
               <button className="link" onClick={() => setReq((r) => ({ ...r, drones: r.drones.filter((_, j) => j !== i) }))}>
                 ✕
               </button>
+            </div>
+            {idErrors[i] && <div className="field-error">{idErrors[i]}</div>}
             </div>
           ))}
           <select value="" onChange={(e) => addDrone(e.target.value)}>
@@ -325,36 +408,76 @@ export default function App() {
           <h2>Критерий оптимизации</h2>
           <div className="criterion">
             <span>суммарный налёт</span>
-            <input type="range" min="0" max="1" step="0.1" value={req.time_weight}
+            <input type="range" min="0" max="1" step="0.05" value={req.time_weight}
               onChange={(e) => setReq({ ...req, time_weight: +e.target.value })} />
             <span>время работ</span>
           </div>
+          <p className="hint criterion-value">
+            {epsSelected
+              ? 'ε-ограничение: выбранный план фронта построен не взвешенной суммой, вес к нему не относится'
+              : `Вес «время работ» w = ${req.time_weight}`}
+          </p>
           <button className="primary" disabled={!canRun} onClick={run}>
-            {busy ? 'Расчёт…' : 'Рассчитать план'}
+            {busy ? <><span className="spinner" /> Расчёт… {elapsed} с</> : 'Рассчитать план'}
           </button>
-          <button className="secondary" disabled={!canRun || paretoBusy} onClick={runPareto}>
-            {paretoBusy ? 'Строим фронт Парето…' : 'Сравнить варианты (фронт Парето)'}
+          <button className="secondary" disabled={!canRun} onClick={runPareto}>
+            {paretoBusy ? <><span className="spinner dark" /> Строим фронт Парето… {elapsed} с</> : 'Сравнить варианты (фронт Парето)'}
           </button>
+          {hasIdErrors && <p className="field-error">Исправьте id бортов — они должны быть уникальными и непустыми.</p>}
           {front && front.length > 0 && (
-            <div className="pareto">
+            <div className={frontStale ? 'pareto stale' : 'pareto'}>
               <p className="hint">
                 Каждая точка — недоминируемый план. Левее — быстрее, ниже — меньше суммарный налёт. Нажмите на точку, чтобы
                 открыть план.
               </p>
-              <ParetoChart front={front} selected={plan?.plan_id ?? null} onSelect={setPlan} />
+              <ParetoChart
+                front={front}
+                selected={plan?.plan_id ?? null}
+                onSelect={(p) => shown && !frontStale && selectFrontPlan(p, front, shown.key, req.time_weight)}
+              />
             </div>
           )}
-          {error && <p className="error">{error}</p>}
+          {error && (
+            <div className="error" role="alert">
+              <p>{error.message}</p>
+              {error.items.length > 0 && (
+                <ul>
+                  {error.items.map((t, i) => <li key={i}>{t}</li>)}
+                </ul>
+              )}
+              {error.excluded.length > 0 && (
+                <>
+                  <p>Исключённые борта:</p>
+                  <ul>
+                    {error.excluded.map((e) => <li key={e.drone_id}><b>{e.drone_id}</b>: {e.reason}</li>)}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
         </section>
 
         {plan && (
-          <section>
+          <section className="result">
+            {stale && (
+              <div className="stale-banner" role="status">
+                Входные данные изменились — нажмите «Рассчитать план»
+              </div>
+            )}
+            <div className={stale ? 'result-body stale' : 'result-body'}>
             <h2>Результат</h2>
+            {shown && <div className="badge">Критерий: {criterionLabel(shown.criterion)}</div>}
             <div className="kpis">
               <div><b>{min(plan.summary.makespan_s)}</b><span>время работ</span></div>
               <div><b>{min(plan.summary.total_flight_s)}</b><span>суммарный налёт</span></div>
               <div><b>{plan.summary.sorties}</b><span>вылетов</span></div>
-              <div><b>{plan.summary.coverage_pct.toFixed(1)}%</b><span>покрытие {plan.summary.area_km2.toFixed(2)} км²</span></div>
+              <div
+                className={plan.summary.coverage_pct < COVERAGE_OK_PCT ? 'warn' : ''}
+                title={`снято ${plan.summary.covered_km2.toFixed(3)} из ${plan.summary.area_km2.toFixed(3)} км²`}
+              >
+                <b>{formatCoverage(plan.summary.coverage_pct)}%</b>
+                <span>покрытие {plan.summary.area_km2.toFixed(2)} км²</span>
+              </div>
             </div>
             <h2>Вылеты во времени, мин</h2>
             <Gantt plan={plan} colors={droneColor} />
@@ -373,15 +496,15 @@ export default function App() {
                     <td>{min(d.finish_s)}</td>
                     <td>{min(Math.max(...d.sorties.map((s) => s.max_divert_s)))}</td>
                     <td>
-                      <a href={api.exportUrl(plan.plan_id, d.drone_id, 'geojson')}>GeoJSON</a>{' '}
-                      <a href={api.exportUrl(plan.plan_id, d.drone_id, 'kml')}>KML</a>
+                      <ExportLink stale={stale} href={api.exportUrl(plan.plan_id, d.drone_id, 'geojson')}>GeoJSON</ExportLink>{' '}
+                      <ExportLink stale={stale} href={api.exportUrl(plan.plan_id, d.drone_id, 'kml')}>KML</ExportLink>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
             <p className="hint">* Уход — худшее время до ближайшей ВПП или резервной площадки с посадкой.</p>
-            <a className="button" href={api.zipUrl(plan.plan_id)}>Скачать все задания (ZIP)</a>
+            <ExportLink className="button" stale={stale} href={api.zipUrl(plan.plan_id)}>Скачать все задания (ZIP)</ExportLink>
             {plan.excluded.length > 0 && (
               <ul className="excluded">
                 {plan.excluded.map((e) => (
@@ -396,11 +519,13 @@ export default function App() {
                 ))}
               </ul>
             )}
+            </div>
           </section>
         )}
       </aside>
       <main>
-        <MapView req={req} plan={plan} drawMode={drawMode} onDrawn={onDrawn} fitKey={fitKey} />
+        <MapView req={req} plan={plan} stale={stale} drawMode={drawMode} onDrawn={onDrawn} fitKey={fitKey} />
+        {plan && stale && <div className="map-stale">Маршруты на карте устарели — пересчитайте план</div>}
         {drawMode && (
           <div className="draw-hint">
             Рисование: {DRAW_BUTTONS.find((b) => b.mode === drawMode)?.label}. Esc — отмена.

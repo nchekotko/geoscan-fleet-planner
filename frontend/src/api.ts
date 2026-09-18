@@ -1,4 +1,5 @@
 import type { Geometry, Polygon, MultiPolygon } from 'geojson'
+import { parseErrorDetail, type ExcludedInfo } from './logic'
 
 export type SurveyType = 'rgb' | 'multispectral' | 'thermal' | 'lidar' | 'geophysics'
 
@@ -99,6 +100,8 @@ export interface PlanResponse {
   warnings: string[]
   working_area: Geometry
   time_weight: number
+  /** ограничение на время работ (метод ε-ограничений); есть не во всех версиях API */
+  makespan_cap_s?: number | null
 }
 
 export interface DroneModel {
@@ -122,16 +125,27 @@ export interface Fleet {
   payloads: Record<string, Payload>
 }
 
+/** Ошибка API с разобранными деталями: список ошибок валидации и исключённые борта. */
+export class ApiError extends Error {
+  items: string[]
+  excluded: ExcludedInfo[]
+  constructor(message: string, items: string[] = [], excluded: ExcludedInfo[] = []) {
+    super(message)
+    this.items = items
+    this.excluded = excluded
+  }
+}
+
 async function json<T>(r: Response): Promise<T> {
   if (!r.ok) {
-    let msg = `${r.status}`
+    let body: { detail?: unknown } | null = null
     try {
-      const body = await r.json()
-      msg = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
+      body = await r.json()
     } catch {
       /* тело не JSON */
     }
-    throw new Error(msg)
+    const e = parseErrorDetail(body?.detail ?? `${r.status} ${r.statusText}`.trim(), r.status)
+    throw new ApiError(e.message, e.items, e.excluded)
   }
   return r.json() as Promise<T>
 }

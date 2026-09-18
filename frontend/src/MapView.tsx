@@ -13,12 +13,16 @@ export const DRONE_COLORS = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb
 interface Props {
   req: PlanRequest
   plan: PlanResponse | null
+  /** план посчитан по другим входным данным — приглушаем маршруты */
+  stale: boolean
   drawMode: DrawMode
   onDrawn: (mode: Exclude<DrawMode, null>, geom: Polygon | { lon: number; lat: number }) => void
   fitKey: number
 }
 
-export default function MapView({ req, plan, drawMode, onDrawn, fitKey }: Props) {
+const RESULTS_PANE = 'results'
+
+export default function MapView({ req, plan, stale, drawMode, onDrawn, fitKey }: Props) {
   const el = useRef<HTMLDivElement>(null)
   const map = useRef<L.Map | null>(null)
   const inputs = useRef<L.LayerGroup>(L.layerGroup())
@@ -35,6 +39,8 @@ export default function MapView({ req, plan, drawMode, onDrawn, fitKey }: Props)
       maxZoom: 19,
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(m)
+    // маршруты — в отдельной панели, чтобы приглушать их целиком
+    m.createPane(RESULTS_PANE).style.zIndex = '400'
     results.current.addTo(m)
     inputs.current.addTo(m)
     m.pm.setLang('ru')
@@ -97,7 +103,7 @@ export default function MapView({ req, plan, drawMode, onDrawn, fitKey }: Props)
     if (!plan) return
     plan.drones.forEach((d, i) => {
       const color = DRONE_COLORS[i % DRONE_COLORS.length]
-      L.geoJSON(d.region, { style: { color, weight: 1, fillOpacity: 0.08, dashArray: '2 4' } }).addTo(g)
+      L.geoJSON(d.region, { pane: RESULTS_PANE, style: { color, weight: 1, fillOpacity: 0.08, dashArray: '2 4' } }).addTo(g)
       for (const s of d.sorties) {
         for (const leg of s.legs) {
           if (leg.kind === 'takeoff' || leg.kind === 'landing') continue
@@ -110,7 +116,7 @@ export default function MapView({ req, plan, drawMode, onDrawn, fitKey }: Props)
                 : leg.kind === 'turn'
                 ? { color, weight: 1.5, opacity: 0.7 }
                 : { color, weight: 2, dashArray: '6 6', opacity: 0.8 }
-          L.polyline(latlngs, style)
+          L.polyline(latlngs, { ...style, pane: RESULTS_PANE })
             .bindTooltip(
               `${d.drone_id} · вылет ${s.index + 1} · ${leg.kind} · ${(leg.duration_s / 60).toFixed(1)} мин`,
               { sticky: true },
@@ -120,6 +126,10 @@ export default function MapView({ req, plan, drawMode, onDrawn, fitKey }: Props)
       }
     })
   }, [plan])
+
+  useEffect(() => {
+    map.current?.getPane(RESULTS_PANE)?.classList.toggle('stale', stale)
+  }, [stale])
 
   useEffect(() => {
     const m = map.current

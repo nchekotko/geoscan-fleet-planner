@@ -1,4 +1,5 @@
 import type { PlanResponse } from './api'
+import { formatCoverage, isEpsilonPlan } from './logic'
 
 const fmtMin = (s: number) => `${Math.round(s / 60)}`
 
@@ -59,7 +60,7 @@ export function ParetoChart({
             className={p.plan_id === selected ? 'pt selected' : 'pt'}
           />
           <title>
-            {`вес «время» ${p.time_weight}: работы ${fmtMin(p.summary.makespan_s)} мин, налёт ${fmtMin(p.summary.total_flight_s)} мин, бортов ${p.summary.drones_used}`}
+            {`${isEpsilonPlan(p, front) ? 'ε-ограничение' : `вес «время» ${p.time_weight}`}: работы ${fmtMin(p.summary.makespan_s)} мин, налёт ${fmtMin(p.summary.total_flight_s)} мин, покрытие ${formatCoverage(p.summary.coverage_pct)} %, бортов ${p.summary.drones_used}`}
           </title>
         </g>
       ))}
