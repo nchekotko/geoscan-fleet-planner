@@ -20,3 +20,4 @@ sources/*.txt
 !pres/*.pptx
 pres/template.pptx
 pres/deck.md
+.claude/
