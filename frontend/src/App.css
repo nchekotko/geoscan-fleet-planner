@@ -283,3 +283,116 @@ td small {
   font-size: 11px;
   padding: 1px 4px;
 }
+
+/* устаревший результат: входные данные изменились после расчёта */
+.result {
+  position: relative;
+}
+.stale-banner,
+.map-stale {
+  background: #fff4d6;
+  border: 1px solid #e0a800;
+  color: #6b4b00;
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.stale-banner {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  margin-bottom: 8px;
+}
+.map-stale {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 1000;
+}
+.result-body.stale,
+.pareto.stale {
+  opacity: 0.45;
+  filter: grayscale(0.7);
+}
+.pareto.stale .chart {
+  pointer-events: none;
+}
+.leaflet-pane.stale {
+  opacity: 0.4;
+  filter: grayscale(0.8);
+}
+span.disabled {
+  color: #999;
+  cursor: not-allowed;
+}
+span.button.disabled {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 5px 10px;
+  display: inline-block;
+}
+.badge {
+  display: inline-block;
+  background: #e8eef7;
+  color: #1d3557;
+  border-radius: 10px;
+  padding: 2px 10px;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.criterion-value {
+  margin: 2px 0 0;
+}
+.kpis .warn {
+  border-color: #e0a800;
+  background: #fff8e1;
+}
+.kpis .warn b {
+  color: #b36b00;
+}
+.drone {
+  margin-bottom: 6px;
+}
+.drone .row {
+  margin-bottom: 0;
+}
+.row .id.invalid {
+  border: 1px solid #c00;
+  background: #fff0f0;
+}
+.field-error {
+  color: #c00;
+  font-size: 12px;
+  margin: 2px 0 0 18px;
+}
+p.field-error {
+  margin-left: 0;
+}
+.error p {
+  margin: 6px 0 2px;
+}
+.error ul {
+  margin: 2px 0;
+  padding-left: 16px;
+  font-size: 12px;
+}
+.spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: spin 0.8s linear infinite;
+}
+.spinner.dark {
+  border-color: rgba(29, 53, 87, 0.25);
+  border-top-color: #1d3557;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
