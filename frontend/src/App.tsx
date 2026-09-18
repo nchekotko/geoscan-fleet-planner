@@ -1,20 +1,36 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import './App.css'
-import MapView, { DRONE_COLORS, type DrawMode } from './MapView'
+import MapView, { DRONE_COLORS, type DrawMode, type FitRequest } from './MapView'
+import ImportChooser from './ImportChooser'
 import { api, ApiError, type Fleet, type PlanRequest, type PlanResponse, type SurveyType } from './api'
 import { Gantt, ParetoChart } from './charts'
 import {
+  applyEdit,
+  applyImport,
+  bboxOf,
   COVERAGE_OK_PCT,
   criterionLabel,
   droneIdErrors,
+  EMPTY_REQUEST as EMPTY,
   formatCoverage,
   isEpsilonPlan,
   nextBaseId,
   nextDroneId,
   nextFreeId,
+  normalizeScenario,
+  parseGeometryFile,
+  parseScenarioText,
+  requestBBox,
   requestKey,
+  scenarioJSON,
+  ScenarioError,
+  type BBox,
   type Criterion,
+  type EditTarget,
+  type EditValue,
   type ExcludedInfo,
+  type ImportChoice,
+  type ImportedGeometry,
 } from './logic'
 
 const SURVEY_TYPES: { id: SurveyType; label: string }[] = [
@@ -25,20 +41,7 @@ const SURVEY_TYPES: { id: SurveyType; label: string }[] = [
   { id: 'geophysics', label: 'Геофизическая' },
 ]
 
-const EMPTY: PlanRequest = {
-  survey_area: null,
-  allowed_area: null,
-  no_fly_zones: [],
-  bases: [],
-  reserve_sites: [],
-  drones: [],
-  survey_type: 'rgb',
-  requirements: { gsd_cm: 3, front_overlap: 0.75, side_overlap: 0.65, lidar_density_pts_m2: 50 },
-  wind: { speed_ms: 0, from_deg: 0 },
-  time_weight: 1,
-  reserve: 0.2,
-  nfz_buffer_m: 30,
-}
+const GEOMETRY_ACCEPT = '.kml,.geojson,.json,application/vnd.google-earth.kml+xml,application/geo+json,application/json'
 
 const DRAW_BUTTONS: { mode: Exclude<DrawMode, null>; label: string }[] = [
   { mode: 'survey', label: 'Область съёмки' },
@@ -66,7 +69,54 @@ interface UiError {
 const toUiError = (e: unknown): UiError =>
   e instanceof ApiError
     ? { message: e.message, items: e.items, excluded: e.excluded }
-    : { message: (e as Error).message, items: [], excluded: [] }
+    : e instanceof ScenarioError
+      ? { message: e.message, items: e.items, excluded: [] }
+      : { message: (e as Error).message, items: [], excluded: [] }
+
+/** Блок ошибки: сообщение, список замечаний, исключённые борта. */
+function ErrorBox({ error }: { error: UiError }) {
+  return (
+    <div className="error" role="alert">
+      <p>{error.message}</p>
+      {error.items.length > 0 && (
+        <ul>
+          {error.items.map((t, i) => <li key={i}>{t}</li>)}
+        </ul>
+      )}
+      {error.excluded.length > 0 && (
+        <>
+          <p>Исключённые борта:</p>
+          <ul>
+            {error.excluded.map((e) => <li key={e.drone_id}><b>{e.drone_id}</b>: {e.reason}</li>)}
+          </ul>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Отдать пользователю текст как файл (скачивание). */
+function download(name: string, text: string, type: string) {
+  const url = URL.createObjectURL(new Blob([text], { type }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+const pad2 = (n: number) => String(n).padStart(2, '0')
+const fileStamp = (d: Date) =>
+  `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}`
+
+/** Прочитанный, но ещё не назначенный файл геометрии. */
+interface PendingImport {
+  id: number
+  file: string
+  data: ImportedGeometry
+}
 
 /** Ссылка экспорта; у устаревшего плана — неактивна. */
 function ExportLink({ href, stale, className, children }: { href: string; stale: boolean; className?: string; children: string }) {
@@ -87,7 +137,14 @@ export default function App() {
   const [drawMode, setDrawMode] = useState<DrawMode>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<UiError | null>(null)
-  const [fitKey, setFitKey] = useState(0)
+  const [fit, setFit] = useState<FitRequest>({ key: 0, bbox: null })
+  const [editing, setEditing] = useState(false)
+  const [scenarioName, setScenarioName] = useState('')
+  const [scenarioError, setScenarioError] = useState<UiError | null>(null)
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null)
+  const [importError, setImportError] = useState<UiError | null>(null)
+  const scenarioFile = useRef<HTMLInputElement>(null)
+  const geometryFile = useRef<HTMLInputElement>(null)
   const [front, setFront] = useState<PlanResponse[] | null>(null)
   const [paretoBusy, setParetoBusy] = useState(false)
   const [shown, setShown] = useState<Shown | null>(null)
@@ -103,7 +160,11 @@ export default function App() {
   }, [computing])
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setDrawMode(null)
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      setDrawMode(null)
+      setEditing(false)
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [])
@@ -113,15 +174,78 @@ export default function App() {
     api.scenarios().then(setScenarios).catch(() => {})
   }, [])
 
-  const loadScenario = async (name: string) => {
-    if (!name) return
-    const s = await api.scenario(name)
-    setReq({ ...EMPTY, ...s, requirements: { ...EMPTY.requirements, ...s.requirements } })
+  const fitTo = (bbox: BBox | null) => bbox && setFit((f) => ({ key: f.key + 1, bbox }))
+
+  // новый сценарий: прежний план и фронт к нему не относятся
+  const applyScenario = (s: PlanRequest) => {
+    setReq(s)
     setPlan(null)
     setFront(null)
     setShown(null)
     setError(null)
-    setFitKey((k) => k + 1)
+    setScenarioError(null)
+    fitTo(requestBBox(s))
+  }
+
+  const loadScenario = async (name: string) => {
+    setScenarioName(name)
+    if (!name) return
+    try {
+      applyScenario(normalizeScenario(await api.scenario(name)))
+    } catch (e) {
+      setScenarioError(toUiError(e))
+    }
+  }
+
+  const saveScenario = () => download(`scenario_${fileStamp(new Date())}.json`, scenarioJSON(req), 'application/json')
+
+  const onScenarioFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = '' // чтобы повторный выбор того же файла снова сработал
+    if (!file) return
+    try {
+      applyScenario(parseScenarioText(await file.text()))
+      setScenarioName('')
+    } catch (err) {
+      setScenarioError(toUiError(err))
+    }
+  }
+
+  const onGeometryFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    setImportError(null)
+    setPendingImport(null)
+    try {
+      const data = parseGeometryFile(file.name, await file.text())
+      if (!data.polygons.length && !data.points.length)
+        setImportError({ message: `В файле ${file.name} нет полигонов и точек.`, items: data.warnings, excluded: [] })
+      else setPendingImport({ id: Date.now(), file: file.name, data })
+    } catch (err) {
+      setImportError(toUiError(err))
+    }
+  }
+
+  const applyImported = (choice: ImportChoice) => {
+    if (!pendingImport) return
+    const { data } = pendingImport
+    setReq((r) => applyImport(r, data, choice))
+    fitTo(bboxOf(choice.polygons ? data.polygons : [], choice.points ? data.points : []))
+    setPendingImport(null)
+  }
+
+  // правка на карте идёт через тот же req — план от этого становится устаревшим
+  const onEdited = (target: EditTarget, value: EditValue) => setReq((r) => applyEdit(r, target, value))
+
+  const chooseDraw = (mode: Exclude<DrawMode, null>) => {
+    setEditing(false)
+    setDrawMode(drawMode === mode ? null : mode)
+  }
+
+  const toggleEditing = () => {
+    setDrawMode(null)
+    setEditing((v) => !v)
   }
 
   const onDrawn = (mode: Exclude<DrawMode, null>, g: GeoJSON.Polygon | { lon: number; lat: number }) => {
@@ -220,27 +344,62 @@ export default function App() {
 
         <section>
           <h2>Сценарий</h2>
-          <select defaultValue="" onChange={(e) => loadScenario(e.target.value)}>
+          <select value={scenarioName} onChange={(e) => loadScenario(e.target.value)}>
             <option value="">— загрузить тестовый сценарий —</option>
             {scenarios.map((s) => (
               <option key={s}>{s}</option>
             ))}
           </select>
+          <div className="buttons file-buttons">
+            <button onClick={saveScenario} title="Скачать текущие входные данные как JSON-файл сценария">
+              Сохранить сценарий
+            </button>
+            <button onClick={() => scenarioFile.current?.click()} title="Открыть JSON-файл сценария (формат запроса /api/plan)">
+              Загрузить сценарий
+            </button>
+          </div>
+          <input ref={scenarioFile} type="file" accept=".json,application/json" hidden onChange={onScenarioFile} />
+          {scenarioError && <ErrorBox error={scenarioError} />}
         </section>
 
         <section>
           <h2>Геометрия</h2>
           <div className="buttons">
             {DRAW_BUTTONS.map((b) => (
-              <button
-                key={b.mode}
-                className={drawMode === b.mode ? 'active' : ''}
-                onClick={() => setDrawMode(drawMode === b.mode ? null : b.mode)}
-              >
+              <button key={b.mode} className={drawMode === b.mode ? 'active' : ''} onClick={() => chooseDraw(b.mode)}>
                 {b.label}
               </button>
             ))}
           </div>
+          <div className="buttons file-buttons">
+            <button onClick={() => geometryFile.current?.click()} title="Полигоны и точки из файла KML или GeoJSON (WGS84)">
+              Импорт KML/GeoJSON
+            </button>
+            <button
+              className={editing ? 'active' : ''}
+              aria-pressed={editing}
+              onClick={toggleEditing}
+              title="Перетаскивание вершин полигонов, ВПП и резервных площадок"
+            >
+              Редактировать геометрию
+            </button>
+          </div>
+          <input ref={geometryFile} type="file" accept={GEOMETRY_ACCEPT} hidden onChange={onGeometryFile} />
+          {importError && <ErrorBox error={importError} />}
+          {pendingImport && (
+            <ImportChooser
+              key={pendingImport.id}
+              file={pendingImport.file}
+              data={pendingImport.data}
+              initial={{
+                polygons: req.survey_area ? 'nfz' : 'survey',
+                points: req.bases.length ? 'reserve' : 'base',
+              }}
+              has={{ survey: !!req.survey_area, allowed: !!req.allowed_area }}
+              onApply={applyImported}
+              onCancel={() => setPendingImport(null)}
+            />
+          )}
           <div className="objects">
             {req.survey_area && (
               <span className="chip">
@@ -276,7 +435,7 @@ export default function App() {
                 <button className="link" onClick={() => setReq({ ...req, reserve_sites: req.reserve_sites.filter((_, j) => j !== i) })}>✕</button>
               </span>
             ))}
-            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null); setFront(null); setShown(null); setError(null) }}>
+            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null); setFront(null); setShown(null); setError(null); setScenarioName('') }}>
               очистить всё
             </button>
           </div>
@@ -437,24 +596,7 @@ export default function App() {
               />
             </div>
           )}
-          {error && (
-            <div className="error" role="alert">
-              <p>{error.message}</p>
-              {error.items.length > 0 && (
-                <ul>
-                  {error.items.map((t, i) => <li key={i}>{t}</li>)}
-                </ul>
-              )}
-              {error.excluded.length > 0 && (
-                <>
-                  <p>Исключённые борта:</p>
-                  <ul>
-                    {error.excluded.map((e) => <li key={e.drone_id}><b>{e.drone_id}</b>: {e.reason}</li>)}
-                  </ul>
-                </>
-              )}
-            </div>
-          )}
+          {error && <ErrorBox error={error} />}
         </section>
 
         {plan && (
@@ -524,13 +666,30 @@ export default function App() {
         )}
       </aside>
       <main>
-        <MapView req={req} plan={plan} stale={stale} drawMode={drawMode} onDrawn={onDrawn} fitKey={fitKey} />
-        {plan && stale && <div className="map-stale">Маршруты на карте устарели — пересчитайте план</div>}
-        {drawMode && (
-          <div className="draw-hint">
-            Рисование: {DRAW_BUTTONS.find((b) => b.mode === drawMode)?.label}. Esc — отмена.
-          </div>
-        )}
+        <MapView
+          req={req}
+          plan={plan}
+          stale={stale}
+          drawMode={drawMode}
+          onDrawn={onDrawn}
+          editing={editing}
+          onEdited={onEdited}
+          fit={fit}
+        />
+        <div className="map-notes">
+          {drawMode && (
+            <div className="draw-hint">
+              Рисование: {DRAW_BUTTONS.find((b) => b.mode === drawMode)?.label}. Esc — отмена.
+            </div>
+          )}
+          {editing && (
+            <div className="draw-hint">
+              Правка геометрии: тяните вершины, ВПП и резервные площадки; новая вершина — потяните за середину стороны,
+              удалить вершину — правый клик. Esc — выход.
+            </div>
+          )}
+          {plan && stale && <div className="map-stale">Маршруты на карте устарели — пересчитайте план</div>}
+        </div>
       </main>
     </div>
   )
