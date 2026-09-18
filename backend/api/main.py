@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -123,15 +124,23 @@ def make_plan(req: PlanRequest) -> dict:
     return {"plan_id": plan_id, **result.model_dump()}
 
 
+# Фронт Парето считается в пуле процессов на все ядра — одновременно только один расчёт
+_pareto_lock = threading.Semaphore(1)
+
+
 @app.post("/api/pareto")
 def make_pareto(req: PlanRequest) -> list[dict]:
     """Фронт Парето: недоминируемые планы по времени работ и суммарному налёту."""
+    if not _pareto_lock.acquire(timeout=120):
+        raise HTTPException(503, "сервис занят расчётом другого фронта Парето — повторите через минуту")
     try:
         front = pareto_front(req)
     except PlanningError as e:
         raise HTTPException(422, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, f"фронт Парето не построен: {e}") from e
+    finally:
+        _pareto_lock.release()
     if not front:
         raise HTTPException(422, "не удалось построить ни одного плана")
     out = []

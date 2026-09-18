@@ -779,3 +779,14 @@ def test_tailwind_trigger_interval_warning():
     с фактическим продольным перекрытием."""
     res = plan(load_req(use_terrain=False))
     assert any("801-1" in w and "попутном" in w for w in res.warnings)
+
+
+def test_request_limits():
+    """Слишком большая область или слишком много бортов — 422 с понятной причиной."""
+    c = TestClient(app)
+    body = json.loads(SCENARIO.read_text(encoding="utf-8"))
+    big = dict(body, survey_area={"type": "Polygon", "coordinates": [[[37, 55], [38, 55], [38, 56], [37, 56], [37, 55]]]})
+    r = c.post("/api/plan", json=big)
+    assert r.status_code == 422 and "км²" in r.json()["detail"]
+    many = dict(body, drones=[{"id": f"d{i}", "model": "geoscan_gemini"} for i in range(60)])
+    assert c.post("/api/plan", json=many).status_code == 422

@@ -13,6 +13,13 @@ from .sensors import SurveyParams, SurveyRequirements
 from .wind import Wind
 
 
+# Лимиты запроса: защита сервиса от запросов, которые надолго займут все ядра
+MAX_VERTICES = 20_000
+MAX_AREA_KM2 = 1_000.0
+MAX_DRONES = 40
+MAX_NFZ = 200
+
+
 def _polygon_geojson(g: Any, what: str) -> dict[str, Any]:
     """Проверка GeoJSON-полигона: тип Polygon/MultiPolygon, конечные координаты в диапазоне WGS84,
     непустая площадь. Невалидная геометрия (самопересечения) исправляется make_valid."""
@@ -22,8 +29,10 @@ def _polygon_geojson(g: Any, what: str) -> dict[str, Any]:
         geom = shape(g)
     except Exception as e:  # noqa: BLE001 — shapely бросает разные исключения на битый GeoJSON
         raise ValueError(f"{what}: некорректные координаты GeoJSON ({e})") from None
-    for lon, lat, *_ in (c for p in getattr(geom, "geoms", [geom]) for r in [p.exterior, *p.interiors]
-                         for c in r.coords):
+    coords = [c for p in getattr(geom, "geoms", [geom]) for r in [p.exterior, *p.interiors] for c in r.coords]
+    if len(coords) > MAX_VERTICES:
+        raise ValueError(f"{what}: слишком много вершин ({len(coords)}, не больше {MAX_VERTICES}) — упростите контур")
+    for lon, lat, *_ in coords:
         if not (math.isfinite(lon) and math.isfinite(lat)):
             raise ValueError(f"{what}: координаты должны быть конечными числами")
         if not (-180 <= lon <= 180 and -90 <= lat <= 90):
@@ -36,6 +45,11 @@ def _polygon_geojson(g: Any, what: str) -> dict[str, Any]:
             geom = MultiPolygon(parts) if parts else Polygon()
     if geom.is_empty or geom.area <= 0:
         raise ValueError(f"{what}: пустой полигон или полигон нулевой площади")
+    # грубая оценка площади в км² (градусы → км на средней широте) — только для лимита
+    lat_c = geom.centroid.y
+    km2 = geom.area * 111.32 * 110.57 * math.cos(math.radians(lat_c))
+    if what == "область съёмки" and km2 > MAX_AREA_KM2:
+        raise ValueError(f"{what}: {km2:.0f} км² — больше {MAX_AREA_KM2:.0f} км²; разбейте на части")
     return mapping(geom)
 
 
@@ -60,10 +74,10 @@ class PlanRequest(BaseModel):
 
     survey_area: dict[str, Any]                 # GeoJSON Polygon | MultiPolygon
     allowed_area: dict[str, Any] | None = None  # граница разрешённого воздушного пространства
-    no_fly_zones: list[dict[str, Any]] = Field(default_factory=list)
+    no_fly_zones: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_NFZ)
     bases: list[Site]
     reserve_sites: list[Site] = Field(default_factory=list)
-    drones: list[DroneInstance] = Field(min_length=1)
+    drones: list[DroneInstance] = Field(min_length=1, max_length=MAX_DRONES)
     survey_type: SurveyType = "rgb"
     requirements: SurveyRequirements = Field(default_factory=SurveyRequirements)
     wind: Wind = Field(default_factory=Wind)
