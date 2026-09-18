@@ -29,7 +29,7 @@ export interface Requirements {
 
 export interface PlanRequest {
   survey_area: Polygon | MultiPolygon | null
-  allowed_area?: Polygon | null
+  allowed_area?: Polygon | MultiPolygon | null
   no_fly_zones: Polygon[]
   bases: Site[]
   reserve_sites: Site[]

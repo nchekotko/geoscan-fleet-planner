@@ -267,12 +267,27 @@ td small {
 .warnings {
   color: #a15c00;
 }
-.draw-hint {
+/* плашки поверх карты: подсказка режима — по центру, «маршруты устарели» — справа;
+   если не помещаются в строку, переносятся, а не наезжают друг на друга */
+.map-notes {
   position: absolute;
   top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 56px;
+  right: 10px;
   z-index: 1000;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 6px;
+  pointer-events: none;
+}
+.map-notes > * {
+  pointer-events: auto;
+}
+.draw-hint {
+  margin: 0 auto;
+  max-width: 640px;
+  text-align: center;
   background: #1d3557;
   color: #fff;
   padding: 6px 12px;
@@ -282,6 +297,36 @@ td small {
 .site-label {
   font-size: 11px;
   padding: 1px 4px;
+}
+
+/* файлы: сценарий, импорт геометрии, режим правки */
+.file-buttons {
+  margin-top: 6px;
+}
+.import-box {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #c9d3e0;
+  border-left: 3px solid #1d3557;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.import-box .import-title {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+.import-box label select {
+  width: 230px;
+}
+.import-box .warnings {
+  margin: 6px 0;
+}
+.import-box .hint {
+  margin: 4px 0 6px;
+}
+.import-box .buttons {
+  margin-top: 6px;
 }
 
 /* устаревший результат: входные данные изменились после расчёта */
@@ -305,10 +350,7 @@ td small {
   margin-bottom: 8px;
 }
 .map-stale {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 1000;
+  margin-left: auto;
 }
 .result-body.stale,
 .pareto.stale {
