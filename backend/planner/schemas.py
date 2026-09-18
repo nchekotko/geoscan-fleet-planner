@@ -38,11 +38,13 @@ class PlanRequest(BaseModel):
     time_weight: float = Field(1.0, ge=0.0, le=1.0)
     reserve: float = Field(0.2, ge=0.0, le=0.6)
     nfz_buffer_m: float = 30.0
+    use_terrain: bool = True  # рельеф Copernicus DEM GLO-30
 
 
 class LegOut(BaseModel):
     kind: str
     coordinates: list[list[float]]  # [lon, lat, alt_agl]
+    alt_amsl: list[float] | None = None  # абсолютная высота точек (EGM2008), если есть рельеф
     duration_s: float
     distance_m: float
 
@@ -72,6 +74,12 @@ class DronePlanOut(BaseModel):
     finish_s: float
 
 
+class TerrainInfo(BaseModel):
+    source: str
+    ground_min_m: float
+    ground_max_m: float
+
+
 class Summary(BaseModel):
     makespan_s: float
     total_flight_s: float
@@ -96,3 +104,4 @@ class PlanResponse(BaseModel):
     time_weight: float
     reserve_sites: list[Site] = Field(default_factory=list)
     bases: list[Site] = Field(default_factory=list)
+    terrain: TerrainInfo | None = None

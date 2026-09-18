@@ -6,3 +6,4 @@ frontend/dist/
 sources/*.png
 sources/*.html
 sources/jar.txt
+backend/data/dem/

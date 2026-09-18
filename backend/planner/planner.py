@@ -24,6 +24,7 @@ from .energy import check_wind, usable_flight_time_s
 from .fleet import DroneModel, Payload, load_fleet
 from .geo import LocalFrame
 from .mission import Sortie, SortieBuilder, order_passes, schedule
+from .terrain import Terrain
 from .turns import turn_overshoot
 from .grid_partition import grid_partition
 from .mission import FIXED_WING_LANDING_S, FIXED_WING_TAKEOFF_S, MULTIROTOR_DESCENT_MS
@@ -36,6 +37,7 @@ from .schemas import (
     PlanResponse,
     SortieOut,
     Summary,
+    TerrainInfo,
 )
 from .sensors import SurveyInfeasible, SurveyParams, survey_params
 
@@ -413,24 +415,82 @@ class Planner:
             return 0.0
         return unary_union(strips).intersection(self.area).area
 
+    # ------------------------------------------------------------ рельеф
+    def _terrain(self) -> Terrain | None:
+        if not self.req.use_terrain:
+            return None
+        pts = [self.frame.xy_to_lonlat(*p) for p in list(self.bases.values()) + list(self.reserve_sites.values())]
+        minx, miny, maxx, maxy = self.frame.to_wgs(self.area).bounds
+        for lon, lat in pts:
+            minx, miny, maxx, maxy = min(minx, lon), min(miny, lat), max(maxx, lon), max(maxy, lat)
+        t = Terrain((minx - 0.02, miny - 0.02, maxx + 0.02, maxy + 0.02))
+        if not t.available:
+            self.warnings.append(
+                "рельеф недоступен (нет сети и тайлов Copernicus DEM в кэше) — высоты заданы относительно точки старта"
+            )
+            return None
+        return t
+
+    def _dense(self, pts: list[tuple[float, float]], step: float) -> list[tuple[float, float]]:
+        out = [pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            n = max(1, math.ceil(math.dist(a, b) / step))
+            out += [(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(1, n + 1)]
+        return out
+
+    def _ground(self, terrain: Terrain, pts: list[tuple[float, float]]) -> list[float]:
+        h = terrain.heights([self.frame.xy_to_lonlat(x, y) for x, y in pts])
+        return [float(v) if v == v else 0.0 for v in h]  # NaN → 0
+
+    def _apply_terrain(self, terrain: Terrain, r: DroneResult) -> dict[tuple[int, int], tuple[list, list]]:
+        """Абсолютные высоты участков. Мультиротор — огибание рельефа на галсах, постоянный безопасный
+        уровень на перелётах; самолёт — постоянный эшелон на весь вылет (не ниже точки старта)."""
+        agl = r.cand.params.altitude_agl_m
+        step = 50.0 if r.cand.params.tie_line_spacing_m else 100.0
+        out: dict[tuple[int, int], tuple[list, list]] = {}
+        base_ground = self._ground(terrain, [self.bases[r.base_id]])[0]
+        for s in r.sorties:
+            if r.cand.drone.type == "fixed_wing":
+                all_pts = [p for leg in s.legs for p in self._dense(leg.points, 100.0)]
+                level = max(self._ground(terrain, all_pts) + [base_ground]) + agl
+                for i, leg in enumerate(s.legs):
+                    alt = [base_ground if leg.kind in ("takeoff", "landing") and k == 0 else level
+                           for k in range(len(leg.points))]
+                    out[(s.index, i)] = (leg.points, alt)
+                continue
+            for i, leg in enumerate(s.legs):
+                if leg.kind in ("survey", "tie"):
+                    pts = self._dense(leg.points, step)
+                    out[(s.index, i)] = (pts, [g + agl for g in self._ground(terrain, pts)])
+                elif leg.kind in ("takeoff", "landing"):
+                    g = self._ground(terrain, leg.points[:1])[0]
+                    out[(s.index, i)] = (leg.points, [g] + [g + agl] * (len(leg.points) - 1))
+                else:
+                    level = max(self._ground(terrain, self._dense(leg.points, 100.0))) + agl
+                    out[(s.index, i)] = (leg.points, [level] * len(leg.points))
+        return out
+
     def run(self) -> PlanResponse:
         ev, angle = self.solve()
         f = self.frame
+        terrain = self._terrain()
         drones_out: list[DronePlanOut] = []
         for r in ev.results:
             self._check(r)
+            amsl = self._apply_terrain(terrain, r) if terrain else {}
             sorties_out = []
             for s in r.sorties:
-                legs = [
-                    LegOut(
+                legs = []
+                for li, l in enumerate(s.legs):
+                    pts, alts = amsl.get((s.index, li), (l.points, None))
+                    legs.append(LegOut(
                         kind=l.kind,
                         coordinates=[[*f.xy_to_lonlat(x, y), 0.0 if l.kind in ("takeoff", "landing") and i == 0 else l.alt_agl]
-                                     for i, (x, y) in enumerate(l.points)],
+                                     for i, (x, y) in enumerate(pts)],
+                        alt_amsl=[round(a, 1) for a in alts] if alts else None,
                         duration_s=round(l.duration_s, 1),
                         distance_m=round(l.distance_m, 1),
-                    )
-                    for l in s.legs
-                ]
+                    ))
                 sorties_out.append(
                     SortieOut(index=s.index, base_id=s.base_id, start_s=round(s.start_s, 1),
                           max_divert_s=round(s.max_divert_s, 1), divert_site=s.divert_site,
@@ -484,7 +544,16 @@ class Planner:
             time_weight=self.req.time_weight,
             reserve_sites=self.req.reserve_sites,
             bases=self.req.bases,
+            terrain=self._terrain_info(terrain),
         )
+
+    def _terrain_info(self, terrain: Terrain | None) -> TerrainInfo | None:
+        if terrain is None:
+            return None
+        g = self._ground(terrain, self._dense(list(self.area.exterior.coords) if isinstance(self.area, Polygon)
+                                              else [c for p in self.area.geoms for c in p.exterior.coords], 200.0))
+        return TerrainInfo(source="Copernicus DEM GLO-30 (DSM, EGM2008)", ground_min_m=round(min(g), 1),
+                           ground_max_m=round(max(g), 1))
 
 
 def plan(req: PlanRequest) -> PlanResponse:

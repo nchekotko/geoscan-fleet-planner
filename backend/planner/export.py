@@ -38,15 +38,19 @@ PHASE_RU = {
 def waypoints(d: DronePlanOut) -> list[dict[str, Any]]:
     """Ключевые точки: взлёт, начало/конец каждого галса, посадка."""
     wps: list[dict[str, Any]] = []
+
+    def amsl(leg, k):
+        return leg.alt_amsl[k] if leg.alt_amsl else None
+
     for s in d.sorties:
         for leg in s.legs:
             if leg.kind == "takeoff":
-                wps.append({"sortie": s.index + 1, "action": "takeoff", "coord": leg.coordinates[0]})
+                wps.append({"sortie": s.index + 1, "action": "takeoff", "coord": leg.coordinates[0], "amsl": amsl(leg, 0)})
             elif leg.kind in ("survey", "tie"):
-                wps.append({"sortie": s.index + 1, "action": "survey_start", "coord": leg.coordinates[0]})
-                wps.append({"sortie": s.index + 1, "action": "survey_end", "coord": leg.coordinates[-1]})
+                wps.append({"sortie": s.index + 1, "action": "survey_start", "coord": leg.coordinates[0], "amsl": amsl(leg, 0)})
+                wps.append({"sortie": s.index + 1, "action": "survey_end", "coord": leg.coordinates[-1], "amsl": amsl(leg, -1)})
             elif leg.kind == "landing":
-                wps.append({"sortie": s.index + 1, "action": "land", "coord": leg.coordinates[-1]})
+                wps.append({"sortie": s.index + 1, "action": "land", "coord": leg.coordinates[-1], "amsl": amsl(leg, -1)})
     for i, w in enumerate(wps, 1):
         w["seq"] = i
     return wps
@@ -79,6 +83,7 @@ def drone_geojson(d: DronePlanOut, plan: PlanResponse | None = None) -> dict[str
                         "speed_ms": round(d.params.speed_ms, 2),
                         "duration_s": leg.duration_s,
                         "distance_m": leg.distance_m,
+                        "altitude_amsl_m": leg.alt_amsl,
                     },
                 }
             )
@@ -93,6 +98,8 @@ def drone_geojson(d: DronePlanOut, plan: PlanResponse | None = None) -> dict[str
                     "seq": w["seq"],
                     "sortie": w["sortie"],
                     "action": w["action"],
+                    "altitude_agl_m": w["coord"][2] if len(w["coord"]) > 2 else None,
+                    "altitude_amsl_m": w["amsl"],
                 },
             }
         )
@@ -154,9 +161,15 @@ def drone_kml(d: DronePlanOut, plan: PlanResponse | None = None) -> str:
                 p.extendeddata.newdata("phase", leg.kind)
                 p.extendeddata.newdata("duration_s", leg.duration_s)
                 continue
-            ls = f.newlinestring(name=f"{i + 1}. {PHASE_RU.get(leg.kind, leg.kind)}",
-                                 coords=[tuple(c) for c in leg.coordinates])
-            ls.altitudemode = simplekml.AltitudeMode.relativetoground
+            if leg.alt_amsl:
+                # есть рельеф: абсолютные высоты (над геоидом EGM2008)
+                coords = [(c[0], c[1], a) for c, a in zip(leg.coordinates, leg.alt_amsl)]
+                mode = simplekml.AltitudeMode.absolute
+            else:
+                coords = [tuple(c) for c in leg.coordinates]
+                mode = simplekml.AltitudeMode.relativetoground
+            ls = f.newlinestring(name=f"{i + 1}. {PHASE_RU.get(leg.kind, leg.kind)}", coords=coords)
+            ls.altitudemode = mode
             ls.style.linestyle.color = PHASE_COLORS.get(leg.kind, "ffffffff")
             ls.style.linestyle.width = 3 if leg.kind == "survey" else 2
             ls.extendeddata.newdata("phase", leg.kind)

@@ -286,3 +286,42 @@ def test_api_pareto():
     assert r.status_code == 200, r.text
     pts = r.json()
     assert pts and all("plan_id" in p for p in pts)
+
+
+# --- рельеф --------------------------------------------------------------------
+from planner.terrain import DEM_DIR, tile_name  # noqa: E402
+
+HAS_MOSCOW_DEM = (DEM_DIR / f"{tile_name(55, 37)}.tif").exists()
+
+
+@pytest.mark.skipif(not HAS_MOSCOW_DEM, reason="нет тайла Copernicus DEM в кэше")
+def test_terrain_following_keeps_agl():
+    req = scenario("geophysics_401")
+    res = plan(req)
+    assert res.terrain and 50 < res.terrain.ground_min_m < res.terrain.ground_max_m < 400
+    for d in res.drones:
+        for s in d.sorties:
+            for leg in s.legs:
+                if leg.kind in ("survey", "tie"):
+                    assert leg.alt_amsl and len(leg.alt_amsl) == len(leg.coordinates)
+                    assert len(leg.coordinates) >= 2
+
+
+@pytest.mark.skipif(not HAS_MOSCOW_DEM, reason="нет тайла Copernicus DEM в кэше")
+def test_fixed_wing_flies_constant_level_not_below_start():
+    res = plan(load_req(time_weight=0.0))
+    d = res.drones[0]
+    assert d.model == "geoscan_201"
+    for s in d.sorties:
+        takeoff_ground = s.legs[0].alt_amsl[0]
+        levels = {a for l in s.legs if l.kind not in ("takeoff", "landing") for a in l.alt_amsl}
+        assert len(levels) == 1
+        assert levels.pop() >= takeoff_ground + d.params.altitude_agl_m
+
+
+def test_no_terrain_gives_warning(monkeypatch):
+    import planner.terrain as t
+    monkeypatch.setattr(t, "DEM_DIR", Path("nonexistent_dem_dir"))
+    res = plan(load_req())
+    assert res.terrain is None
+    assert any("рельеф недоступен" in w for w in res.warnings)
