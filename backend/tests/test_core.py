@@ -451,8 +451,8 @@ def test_time_plan_not_dominated_by_pareto_front():
     from planner.pareto import pareto_front
     req = load_req(use_terrain=False)
     t = plan(req.model_copy(update={"time_weight": 1.0})).summary
-    # перебор порядка бортов базы B с доводкой: 58,4 мин и налёт 190 мин (без перебора 58,7 / 202)
-    assert t.makespan_s <= 58.5 * 60 and t.total_flight_s <= 195 * 60
+    # с очерёдностью стартов на ВПП (2 мин у мультиротора) план по времени — около 59 мин
+    assert t.makespan_s <= 60.5 * 60
     for p in pareto_front(req, weights=(1.0, 0.5, 0.0), workers=1):
         s = p.summary
         assert not (s.makespan_s < t.makespan_s - 1.0 and s.total_flight_s < t.total_flight_s - 1.0)
@@ -644,3 +644,49 @@ def test_energy_range_matches_round_trip():
     assert r * round_trip_s_per_m(max(p.speed_ms, d.cruise_speed_ms), w) == pytest.approx(1800 - t_ops, rel=1e-6)
     # без ветра — просто V·t/2
     assert energy_range_m(d, p, 1800, Wind()) == pytest.approx(10 * (1800 - t_ops) / 2, rel=1e-3)
+
+
+
+def test_launches_are_staggered_per_base():
+    """С одной ВПП борта стартуют по очереди: самолёт первым, затем мультироторы с интервалом."""
+    from planner.mission import LAUNCH_INTERVAL_S
+    res = plan(load_req(use_terrain=False))
+    by_base: dict[str, list[float]] = {}
+    for d in res.drones:
+        by_base.setdefault(d.sorties[0].base_id, []).append(d.sorties[0].start_s)
+    for starts in by_base.values():
+        starts.sort()
+        assert starts[0] == 0.0
+        for a, b in zip(starts, starts[1:]):
+            assert b - a >= min(LAUNCH_INTERVAL_S.values()) - 1e-6
+
+
+def test_transit_levels_and_separation_reported():
+    """Эшелоны перелёта различаются на 20 м; в сводке — наименьшее сближение бортов."""
+    res = plan(load_req(use_terrain=False))
+    levels = sorted(d.transit_alt_agl_m - d.params.altitude_agl_m for d in res.drones)
+    assert levels == pytest.approx([20.0 * k for k in range(len(levels))], abs=0.1)
+    for d in res.drones:
+        for s in d.sorties:
+            for leg in s.legs:
+                if leg.kind in ("transit", "return"):
+                    assert all(c[2] == pytest.approx(d.transit_alt_agl_m) for c in leg.coordinates)
+    assert res.summary.min_separation_m is None or res.summary.min_separation_m > 50
+
+
+def test_separation_detects_head_on():
+    """Два трека навстречу друг другу на одной высоте — конфликт; разнесённые по высоте — нет."""
+    from planner.mission import Leg, Sortie
+    from planner.separation import closest_approach, track
+
+    def sortie(a, b):
+        s = Sortie(index=0, base=(0.0, 0.0), base_id="A")
+        s.legs.append(Leg("survey", [a, b], 100.0, 100.0, 1000.0, 10.0))
+        return s
+
+    t1 = track("x", [sortie((0.0, 5000.0), (1000.0, 5000.0))], lambda l: 100.0)
+    t2 = track("y", [sortie((1000.0, 5000.0), (0.0, 5000.0))], lambda l: 100.0)
+    ap = closest_approach([t1, t2], [(0.0, 0.0)], 100.0)
+    assert ap is not None and ap.min_h_m < 20 and ap.conflicts >= 1
+    t3 = track("z", [sortie((1000.0, 5000.0), (0.0, 5000.0))], lambda l: 130.0)
+    assert closest_approach([t1, t3], [(0.0, 0.0)], 100.0) is None

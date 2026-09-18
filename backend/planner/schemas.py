@@ -140,6 +140,7 @@ class DronePlanOut(BaseModel):
     sorties: list[SortieOut]
     flight_time_s: float
     finish_s: float
+    transit_alt_agl_m: float = 0.0  # эшелон перелётов (взлёт, транзит, возврат)
 
 
 class TerrainInfo(BaseModel):
@@ -156,6 +157,11 @@ class Summary(BaseModel):
     covered_km2: float
     coverage_pct: float
     drones_used: int
+    # разведение бортов: наименьшее горизонтальное расстояние между бортами на близких высотах
+    # (вне окрестности ВПП) и число моментов с конфликтом (шаг 5 с)
+    min_separation_m: float | None = None
+    separation_pair: list[str] = Field(default_factory=list)
+    separation_conflicts: int = 0
 
 
 class ExcludedDrone(BaseModel):

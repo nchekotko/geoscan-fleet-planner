@@ -38,7 +38,8 @@ from .mission import Sortie, SortieBuilder, order_passes, schedule
 from .terrain import Terrain
 from .turns import turn_overshoot
 from .grid_partition import grid_partition
-from .mission import FIXED_WING_LANDING_S, FIXED_WING_TAKEOFF_S, MULTIROTOR_DESCENT_MS
+from .mission import FIXED_WING_LANDING_S, FIXED_WING_TAKEOFF_S, LAUNCH_INTERVAL_S, MULTIROTOR_DESCENT_MS
+from .separation import H_MIN_M, closest_approach, track
 from .partition import split_by_fractions, strip_axis_position
 from .schemas import (
     DronePlanOut,
@@ -74,6 +75,9 @@ class PlanningError(ValueError):
 REACH_MARGIN = 0.10
 # «выгодный» радиус при делении сеткой: перелёт туда-обратно — не больше этой доли вылета
 PROFITABLE_TRANSIT_SHARE = 0.5
+# шаг эшелонов перелёта: k-й борт летает к области и обратно на k·шаг выше высоты съёмки
+TRANSIT_LEVEL_STEP_M = 20.0
+TRANSIT_KINDS = ("transit", "return")
 
 
 def round_trip_s_per_m(v: float, wind: Wind, steps: int = 72) -> float:
@@ -367,9 +371,17 @@ class Planner:
             workers, list(regions) + [Polygon()] * len(spare), n_active=len(active)
         )
         results: list[DroneResult] = []
-        for k, (cand, region) in enumerate(zip(workers, regions)):
-            if k >= len(active) and region.is_empty:
-                continue
+        work = [(cand, region) for k, (cand, region) in enumerate(zip(workers, regions))
+                if not (k >= len(active) and region.is_empty)]
+        # очередь стартов на каждой ВПП: самолёты первыми (у них самые длинные вылеты),
+        # порядок результатов при этом не меняется — балансировка сопоставляет его с долями
+        launch: dict[str, float] = {}
+        next_launch: dict[str, float] = {}
+        for cand, region in sorted(work, key=lambda cr: cr[0].drone.type != "fixed_wing"):
+            b = cand.base_id or self._default_base(region)
+            launch[cand.instance_id] = next_launch.get(b, 0.0)
+            next_launch[b] = launch[cand.instance_id] + LAUNCH_INTERVAL_S[cand.drone.type]
+        for cand, region in work:
             base_id = cand.base_id or self._default_base(region)
             base = self.bases[base_id]
             p = cand.params
@@ -381,7 +393,7 @@ class Planner:
                 route += order_passes(ties, route[-1].b if route else base, kind="tie")
             builder = SortieBuilder(cand.drone, p.speed_ms, p.altitude_agl_m, self.req.wind, cand.budget_s, self.router)
             sorties = builder.build(route, base, base_id)
-            finish = schedule(sorties, cand.drone.swap_time_min * 60)
+            finish = schedule(sorties, cand.drone.swap_time_min * 60, launch[cand.instance_id])
             results.append(DroneResult(cand, region, base_id, sorties, finish))
         return Evaluation(fractions=list(fractions), results=results, leftover_m2=leftover, unreachable_m2=unreachable)
 
@@ -881,19 +893,24 @@ class Planner:
         f = self.frame
         terrain = self._terrain()
         drones_out: list[DronePlanOut] = []
+        levels = self._transit_levels(ev.results)
         for r in ev.results:
             self._check(r)
             amsl = self._apply_terrain(terrain, r) if terrain else {}
+            off = levels[r.cand.instance_id]
             sorties_out = []
             for s in r.sorties:
                 legs = []
                 for li, l in enumerate(s.legs):
                     pts, alts = amsl.get((s.index, li), (l.points, None))
+                    # эшелон перелёта: взлёт и посадка — до него, транзит и возврат — на нём
+                    lift = off if l.kind in TRANSIT_KINDS + ("takeoff", "landing") else 0.0
                     legs.append(LegOut(
                         kind=l.kind,
-                        coordinates=[[*f.xy_to_lonlat(x, y), 0.0 if _on_ground(l.kind, i, len(pts)) else l.alt_agl]
+                        coordinates=[[*f.xy_to_lonlat(x, y), 0.0 if _on_ground(l.kind, i, len(pts)) else l.alt_agl + lift]
                                      for i, (x, y) in enumerate(pts)],
-                        alt_amsl=[round(a, 1) for a in alts] if alts else None,
+                        alt_amsl=[round(a + (0.0 if _on_ground(l.kind, i, len(alts)) else lift), 1)
+                                  for i, a in enumerate(alts)] if alts else None,
                         duration_s=round(l.duration_s, 1),
                         distance_m=round(l.distance_m, 1),
                         speed_ms=round(l.speed_ms, 2),
@@ -916,6 +933,7 @@ class Planner:
                     sorties=sorties_out,
                     flight_time_s=round(r.flight_s, 1),
                     finish_s=round(r.finish_s, 1),
+                    transit_alt_agl_m=round(r.cand.params.altitude_agl_m + off, 1),
                 )
             )
         unused = {c.instance_id for c in self.candidates} - {r.cand.instance_id for r in ev.results}
@@ -934,6 +952,19 @@ class Planner:
                 f"{ev.unreachable_m2 / 1e6:.3f} км² вне радиуса действия всех бортов (заряд или радиоканал) — "
                 "добавьте ВПП ближе к области или борт с большей дальностью"
             )
+        sep = closest_approach(
+            [track(r.cand.instance_id, r.sorties,
+                   lambda leg, off=levels[r.cand.instance_id]: leg.alt_agl + (off if leg.kind in TRANSIT_KINDS else 0.0))
+             for r in ev.results],
+            list(self.bases.values()),
+            ev.makespan,
+        )
+        if sep is not None and sep.min_h_m < H_MIN_M:
+            self.warnings.append(
+                f"сближение бортов {sep.pair[0]} и {sep.pair[1]} до {sep.min_h_m:.0f} м на одной высоте "
+                f"(через {sep.t_s / 60:.0f} мин от начала работ; моментов с конфликтом: {sep.conflicts}) — "
+                "разнесите их по времени или по высоте"
+            )
         covered = self._coverage(ev.results)
         area = self.area.area
         summary = Summary(
@@ -944,6 +975,9 @@ class Planner:
             covered_km2=round(covered / 1e6, 4),
             coverage_pct=round(100 * covered / area, 2),
             drones_used=len(ev.results),
+            min_separation_m=round(sep.min_h_m, 1) if sep is not None else None,
+            separation_pair=list(sep.pair) if sep is not None else [],
+            separation_conflicts=sep.conflicts if sep is not None else 0,
         )
         return PlanResponse(
             summary=summary,
@@ -958,6 +992,16 @@ class Planner:
             allowed_area=self.req.allowed_area,
             terrain=self._terrain_info(terrain),
         )
+
+    def _transit_levels(self, results: list[DroneResult]) -> dict[str, float]:
+        """Эшелоны перелёта: k-й борт на k·TRANSIT_LEVEL_STEP_M выше высоты съёмки, но не выше
+        потолка разрешённого объёма (если задан)."""
+        ceiling = self.req.requirements.altitude_ceiling_m
+        out = {}
+        for k, r in enumerate(results):
+            room = math.inf if ceiling is None else max(ceiling - r.cand.params.altitude_agl_m, 0.0)
+            out[r.cand.instance_id] = min(TRANSIT_LEVEL_STEP_M * k, room)
+        return out
 
     def _terrain_info(self, terrain: Terrain | None) -> TerrainInfo | None:
         if terrain is None:

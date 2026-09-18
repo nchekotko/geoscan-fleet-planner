@@ -20,6 +20,9 @@ from .wind import Wind, segment_time
 
 # Накладные расходы взлёта/посадки, с (допущения): катапульта + выход на курс, парашют.
 FIXED_WING_TAKEOFF_S = 60.0
+# Интервал между стартами разных бортов с одной ВПП (допущения): катапульту нужно перезарядить
+# и уложить следующий борт, мультиротору — освободить площадку.
+LAUNCH_INTERVAL_S = {"fixed_wing": 300.0, "multirotor": 120.0}
 FIXED_WING_LANDING_S = 120.0
 MULTIROTOR_DESCENT_MS = 3.0
 
@@ -351,10 +354,10 @@ class SortieBuilder:
         return lo
 
 
-def schedule(sorties: list[Sortie], swap_s: float) -> float:
-    """Проставляет время начала вылетов (последовательно, со сменой АКБ). Возвращает время
-    окончания работ этим бортом."""
-    t = 0.0
+def schedule(sorties: list[Sortie], swap_s: float, start_s: float = 0.0) -> float:
+    """Проставляет время начала вылетов (последовательно, со сменой АКБ), первый — в start_s
+    (очерёдность стартов на ВПП). Возвращает время окончания работ этим бортом."""
+    t = start_s
     for i, s in enumerate(sorties):
         if i:
             t += swap_s
