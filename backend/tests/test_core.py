@@ -279,6 +279,16 @@ def test_pareto_front_is_non_dominated():
         assert a.summary.total_flight_s > b.summary.total_flight_s
 
 
+def test_min_flight_time_keeps_full_coverage():
+    """При весе «налёт» = 1 кольца у NFZ, где самолёт не разворачивается, добирает
+    мультиротор, а во фронт Парето не попадают планы с неполным покрытием."""
+    from planner.pareto import pareto_front
+    res = plan(load_req(time_weight=0.0, use_terrain=False))
+    assert res.summary.coverage_pct >= 99.9
+    front = pareto_front(load_req(use_terrain=False), weights=(1.0, 0.5, 0.0), workers=1)
+    assert front and all(p.summary.coverage_pct >= 99.5 for p in front)
+
+
 def test_api_pareto():
     c = TestClient(app)
     body = json.loads((SCENARIO.parent / "strong_wind.json").read_text(encoding="utf-8"))
