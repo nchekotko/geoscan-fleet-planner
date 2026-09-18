@@ -99,3 +99,16 @@ def shortest_path(
     beta = _mod(end[2] - phi)
     best = min(_candidates(alpha, beta, d), key=lambda c: sum(c[1]))
     return DubinsPath(start=start, radius=radius, word=best[0], params=best[1])
+
+
+def all_paths(
+    start: tuple[float, float, float], end: tuple[float, float, float], radius: float
+) -> list[DubinsPath]:
+    """Все допустимые пути Дубинса, от кратчайшего к длинному (для обхода препятствий)."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    d = math.hypot(dx, dy) / radius
+    phi = math.atan2(dy, dx)
+    alpha = _mod(start[2] - phi)
+    beta = _mod(end[2] - phi)
+    cands = sorted(_candidates(alpha, beta, d), key=lambda c: sum(c[1]))
+    return [DubinsPath(start=start, radius=radius, word=w, params=p) for w, p in cands]

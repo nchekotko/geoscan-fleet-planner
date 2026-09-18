@@ -100,7 +100,11 @@ def test_direction_follows_long_side():
 def test_plan_respects_battery_and_covers(w):
     req = load_req(time_weight=w)
     res = plan(req)
-    assert res.summary.coverage_pct > 98
+    if any(d.model != "geoscan_201" for d in res.drones):
+        assert res.summary.coverage_pct > 99  # мультироторы добирают полосы у NFZ
+    else:
+        assert res.summary.coverage_pct > 95
+        assert any("не хватает места для разворота" in w_ for w_ in res.warnings)
     for d in res.drones:
         budget = usable_flight_time_s(FLEET.drones[d.model], req.wind, req.reserve)
         for s in d.sorties:
@@ -187,3 +191,29 @@ def test_router_goes_around_obstacle():
     assert len(pts) > 2
     assert not LineString(pts).intersects(box(-50, -50, 50, 50))
     assert 400 < length(pts) < 520
+
+
+def test_cells_split_around_hole():
+    from planner.coverage import boustrophedon_cells
+    area = box(0, 0, 1000, 600).difference(box(400, 200, 600, 400))
+    cells = boustrophedon_cells(sweep_passes(area, 0.0, 50))
+    # под дырой, слева, справа, над дырой
+    assert len(cells) == 4
+    assert sum(len(c) for c in cells) == len(sweep_passes(area, 0.0, 50))
+
+
+def test_route_around_hole_has_few_detours():
+    """После декомпозиции переходов через дыру почти нет: число транзитов внутри вылета мало."""
+    res = plan(load_req(time_weight=0.0))
+    d = res.drones[0]
+    transits = sum(1 for s in d.sorties for l in s.legs if l.kind == "transit") - len(d.sorties)
+    assert transits <= 3  # 4 ячейки → 3 перехода между ними
+
+
+def test_fixed_wing_turns_never_replaced_by_straight_hops():
+    """Самолёт не «перепрыгивает» между галсами по прямой: все развороты — пути Дубинса."""
+    res = plan(load_req(time_weight=0.0))
+    d = res.drones[0]
+    assert d.model == "geoscan_201"
+    hops = [l for s in d.sorties for l in s.legs if l.kind == "transit" and l.distance_m < 200]
+    assert not hops

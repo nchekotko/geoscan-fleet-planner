@@ -11,9 +11,9 @@ import math
 from dataclasses import dataclass, field
 
 from .avoid import Router
-from .coverage import Pass
+from .coverage import Pass, boustrophedon_cells
 from .fleet import DroneModel
-from .turns import MULTIROTOR_ACCEL, turn_points
+from .turns import MULTIROTOR_ACCEL, turn_options
 from .wind import Wind, segment_time
 
 # Накладные расходы взлёта/посадки, с (допущения): катапульта + выход на курс, парашют.
@@ -64,32 +64,44 @@ class DirectedPass:
         return math.dist(self.a, self.b)
 
 
-def order_passes(passes: list[Pass], start: tuple[float, float]) -> list[DirectedPass]:
-    """Змейка по линиям. Из 4 вариантов входа (первая/последняя линия, левый/правый конец)
-    берём ближайший к базе."""
-    if not passes:
-        return []
-    lines: dict[int, list[Pass]] = {}
-    for p in passes:
-        lines.setdefault(p.line, []).append(p)
-    keys = sorted(lines)
-    best: list[DirectedPass] | None = None
+def _snake(cell: list[Pass], start: tuple[float, float]) -> list[DirectedPass]:
+    """Змейка по ячейке. Из 4 вариантов входа (первая/последняя линия, левый/правый конец)
+    берём ближайший к текущей точке."""
+    best: list[DirectedPass] = []
     best_d = math.inf
-    for rev_lines in (False, True):
-        for first_forward in (True, False):
+    for rev in (False, True):
+        for first_fwd in (True, False):
             seq: list[DirectedPass] = []
-            fwd = first_forward
-            for k in (reversed(keys) if rev_lines else keys):
-                segs = sorted(lines[k], key=lambda p: p.seq)
-                if not fwd:
-                    segs = list(reversed(segs))
-                for s in segs:
-                    seq.append(DirectedPass(s.a, s.b) if fwd else DirectedPass(s.b, s.a))
+            fwd = first_fwd
+            for p in (reversed(cell) if rev else cell):
+                seq.append(DirectedPass(p.a, p.b) if fwd else DirectedPass(p.b, p.a))
                 fwd = not fwd
             d = math.dist(start, seq[0].a)
             if d < best_d:
                 best, best_d = seq, d
-    return best or []
+    return best
+
+
+def order_passes(passes: list[Pass], start: tuple[float, float]) -> list[DirectedPass]:
+    """Порядок обхода: ячейки boustrophedon, внутри ячейки — змейка, следующая ячейка —
+    ближайшая к концу предыдущей (жадно)."""
+    if not passes:
+        return []
+    cells = boustrophedon_cells(passes)
+    route: list[DirectedPass] = []
+    pos = start
+    left = list(range(len(cells)))
+    while left:
+        best_i, best_seq, best_d = -1, [], math.inf
+        for i in left:
+            seq = _snake(cells[i], pos)
+            d = math.dist(pos, seq[0].a)
+            if d < best_d:
+                best_i, best_seq, best_d = i, seq, d
+        route += best_seq
+        pos = best_seq[-1].b
+        left.remove(best_i)
+    return route
 
 
 class SortieBuilder:
@@ -103,6 +115,7 @@ class SortieBuilder:
         router: Router | None = None,
     ):
         self.router = router
+        self.blocked_turns = 0  # развороты, которые пришлось заменить обходом
         self.drone = drone
         self.speed = speed
         self.transit_speed = max(speed, drone.cruise_speed_ms)
@@ -135,12 +148,13 @@ class SortieBuilder:
         if heading is None:
             pts = self.path(pos, dp.a)
             return "transit", pts, self.path_time(pts, self.transit_speed), _plen(pts)
-        mid, turn_len = turn_points(self.drone, pos, heading, dp.a, dp.heading)
-        pts = [pos, *mid, dp.a]
-        if self.router is None or self.router.polyline_free(pts):
-            if self.drone.type == "fixed_wing":
-                return "turn", pts, turn_len / self.speed, turn_len
-            return "turn", pts, self.fly_time(pos, dp.a, self.speed) + self.speed / MULTIROTOR_ACCEL, turn_len
+        for mid, turn_len in turn_options(self.drone, pos, heading, dp.a, dp.heading):
+            pts = [pos, *mid, dp.a]
+            if self.router is None or self.router.polyline_free(pts):
+                if self.drone.type == "fixed_wing":
+                    return "turn", pts, turn_len / self.speed, turn_len
+                return "turn", pts, self.fly_time(pos, dp.a, self.speed) + self.speed / MULTIROTOR_ACCEL, turn_len
+        self.blocked_turns += 1
         pts = self.path(pos, dp.a)
         t = self.path_time(pts, self.transit_speed)
         # поправка на смену курса: полуокружность у самолёта, торможение/разгон у мультиротора

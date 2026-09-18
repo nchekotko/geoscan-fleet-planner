@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 
-from .dubins import shortest_path
+from .dubins import all_paths, shortest_path
 from .fleet import DroneModel
 
 MULTIROTOR_ACCEL = 2.5  # м/с², допущение
@@ -36,3 +36,28 @@ def turn_points(
     path = shortest_path((*p_end, heading_end), (*p_next, heading_next), drone.turn_radius_m)
     pts = [(x, y) for x, y, _ in path.sample(step)[1:-1]]
     return pts, path.length
+
+
+def turn_options(
+    drone: DroneModel,
+    p_end: tuple[float, float],
+    heading_end: float,
+    p_next: tuple[float, float],
+    heading_next: float,
+    step: float = 25.0,
+) -> list[tuple[list[tuple[float, float]], float]]:
+    """Варианты разворота от кратчайшего: для самолёта — все пути Дубинса."""
+    if drone.type != "fixed_wing":
+        return [([], math.dist(p_end, p_next))]
+    out = []
+    for path in all_paths((*p_end, heading_end), (*p_next, heading_next), drone.turn_radius_m):
+        out.append(([(x, y) for x, y, _ in path.sample(step)[1:-1]], path.length))
+    return out
+
+
+def turn_overshoot(drone: DroneModel, spacing: float) -> float:
+    """Насколько разворот между соседними галсами выходит за конец галса (м)."""
+    if drone.type != "fixed_wing":
+        return 0.0
+    path = shortest_path((0.0, 0.0, 0.0), (0.0, spacing, math.pi), drone.turn_radius_m)
+    return max(0.0, max(x for x, _, _ in path.sample(2.0)))

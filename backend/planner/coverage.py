@@ -28,6 +28,8 @@ class Pass:
     seq: int
     a: tuple[float, float]
     b: tuple[float, float]
+    lo: float = 0.0  # интервал вдоль направления галсов (в повёрнутой системе)
+    hi: float = 0.0
 
     @property
     def length(self) -> float:
@@ -58,7 +60,7 @@ def sweep_passes(
             x1, x2 = sorted((s.coords[0][0], s.coords[-1][0]))
             back = affinity.rotate(LineString([(x1, y), (x2, y)]), angle, origin=(0, 0), use_radians=True)
             c = list(back.coords)
-            passes.append(Pass(line=i, seq=j, a=c[0], b=c[1]))
+            passes.append(Pass(line=i, seq=j, a=c[0], b=c[1], lo=x1, hi=x2))
     return passes
 
 
@@ -119,3 +121,37 @@ def best_direction(
     if best is None:
         raise ValueError(f"{drone.name}: ветер не позволяет выполнить съёмку ни в одном направлении")
     return best
+
+
+def boustrophedon_cells(passes: list[Pass]) -> list[list[Pass]]:
+    """Клеточная декомпозиция (Choset, 2000) по готовым галсам: куски соседних линий,
+    которые переходят друг в друга один-к-одному, образуют одну ячейку. На событиях
+    (появление/исчезновение дыры, ветвление области) начинается новая ячейка."""
+    by_line: dict[int, list[Pass]] = {}
+    for p in passes:
+        by_line.setdefault(p.line, []).append(p)
+    for v in by_line.values():
+        v.sort(key=lambda p: p.seq)
+
+    def overlaps(a: Pass, b: Pass) -> bool:
+        return a.lo < b.hi and b.lo < a.hi
+
+    cell_of: dict[int, int] = {}
+    cells: list[list[Pass]] = []
+    prev: list[Pass] = []
+    for line in sorted(by_line):
+        cur = by_line[line]
+        for p in cur:
+            ups = [q for q in prev if overlaps(p, q)]
+            if len(ups) == 1:
+                q = ups[0]
+                downs = [r for r in cur if overlaps(q, r)]
+                if len(downs) == 1 and (line - 1 == q.line):
+                    cid = cell_of[id(q)]
+                    cells[cid].append(p)
+                    cell_of[id(p)] = cid
+                    continue
+            cell_of[id(p)] = len(cells)
+            cells.append([p])
+        prev = cur
+    return cells

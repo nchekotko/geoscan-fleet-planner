@@ -22,6 +22,7 @@ from .energy import check_wind, usable_flight_time_s
 from .fleet import DroneModel, Payload, load_fleet
 from .geo import LocalFrame
 from .mission import Sortie, SortieBuilder, order_passes, schedule
+from .turns import turn_overshoot
 from .partition import split_by_fractions, strip_axis_position
 from .schemas import (
     DronePlanOut,
@@ -67,6 +68,7 @@ class DroneResult:
 class Evaluation:
     fractions: list[float]
     results: list[DroneResult]
+    leftover_m2: float = 0.0  # не снято: самолёту не хватает места для разворота, мультиротора нет
 
     @property
     def makespan(self) -> float:
@@ -173,9 +175,48 @@ class Planner:
         c = region.centroid
         return min(self.bases, key=lambda b: math.dist(self.bases[b], (c.x, c.y)))
 
+    def _reassign_turn_gaps(
+        self, cands: list[Candidate], regions: list[BaseGeometry]
+    ) -> tuple[list[BaseGeometry], float]:
+        """Полосы у NFZ, где самолёт не может развернуться, отдаём ближайшему мультиротору."""
+        multi = [i for i, c in enumerate(cands) if c.drone.type == "multirotor"]
+        regions = list(regions)
+        leftover = 0.0
+        for i, c in enumerate(cands):
+            if c.drone.type != "fixed_wing" or regions[i].is_empty:
+                continue
+            room = self._turn_room(regions[i], c)
+            gap = _polys(regions[i].difference(room))
+            if gap.is_empty or gap.area < 1.0:
+                continue
+            regions[i] = room
+            if not multi:
+                leftover += gap.area
+                continue
+            for piece in getattr(gap, "geoms", [gap]):
+                if piece.area < 1.0:
+                    continue
+                j = min(multi, key=lambda k: regions[k].distance(piece) if not regions[k].is_empty else math.inf)
+                regions[j] = _polys(unary_union([regions[j], piece]))
+        return regions, leftover
+
+    def _turn_room(self, region: BaseGeometry, cand: Candidate) -> BaseGeometry:
+        """Самолёту нужен запас для разворота за концом галса: отступаем от NFZ и от границы
+        разрешённой зоны на вынос петли разворота."""
+        over = turn_overshoot(cand.drone, cand.params.line_spacing_m)
+        if over <= 0:
+            return region
+        r = region
+        if self.nfz:
+            r = r.difference(unary_union([z.buffer(self.req.nfz_buffer_m + over) for z in self.nfz]))
+        if self.allowed is not None:
+            r = r.intersection(self.allowed.buffer(-over))
+        return _polys(r)
+
     def evaluate(self, cands: list[Candidate], fractions: list[float], angle: float) -> Evaluation:
         active = [(c, f) for c, f in zip(cands, fractions) if f > 1e-6]
         regions = split_by_fractions(self.area, angle, [f for _, f in active])
+        regions, leftover = self._reassign_turn_gaps([c for c, _ in active], regions)
         results: list[DroneResult] = []
         for (cand, _), region in zip(active, regions):
             base_id = cand.base_id or self._default_base(region)
@@ -187,7 +228,7 @@ class Planner:
             sorties = builder.build(route, base, base_id)
             finish = schedule(sorties, cand.drone.swap_time_min * 60)
             results.append(DroneResult(cand, region, base_id, sorties, finish))
-        return Evaluation(fractions=list(fractions), results=results)
+        return Evaluation(fractions=list(fractions), results=results, leftover_m2=leftover)
 
     # ---------------------------------------------------------- оптимизация
     def solve(self) -> tuple[Evaluation, float]:
@@ -337,6 +378,11 @@ class Planner:
         unused = {c.instance_id for c in self.candidates} - {r.cand.instance_id for r in ev.results}
         for u in sorted(unused):
             self.excluded.append(ExcludedDrone(drone_id=u, reason="не задействован: так выгоднее по выбранному критерию"))
+        if ev.leftover_m2 > 100:
+            self.warnings.append(
+                f"{ev.leftover_m2 / 1e6:.3f} км² у запретных зон не снято: самолёту не хватает места для "
+                "разворота. Добавьте в парк мультиротор или увеличьте запас вокруг зон"
+            )
         covered = self._coverage(ev.results)
         area = self.area.area
         summary = Summary(
