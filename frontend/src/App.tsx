@@ -50,6 +50,12 @@ export default function App() {
   const [paretoBusy, setParetoBusy] = useState(false)
 
   useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setDrawMode(null)
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  useEffect(() => {
     api.fleet().then(setFleet).catch((e) => setError(`API недоступен: ${e.message}`))
     api.scenarios().then(setScenarios).catch(() => {})
   }, [])
