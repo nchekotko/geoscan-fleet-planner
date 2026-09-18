@@ -281,17 +281,7 @@ class Planner:
 
     # ---------------------------------------------------------- оптимизация
     def solve(self) -> tuple[Evaluation, float]:
-        cands = self.candidates
-        # направление галсов — по самому производительному борту
-        lead = max(cands, key=lambda c: c.productivity)
-        angle, _, _ = best_direction(self.area, lead.params.line_spacing_m, lead.drone, lead.params.speed_ms, self.req.wind)
-
-        # порядок полос ↔ положение баз вдоль оси, перпендикулярной галсам
-        def axis_key(c: Candidate) -> float:
-            b = self.bases[c.base_id or self._default_base(self.area)]
-            return strip_axis_position(b, angle)
-
-        cands.sort(key=axis_key)
+        cands, angle = self.prepare()
         fr = [c.productivity for c in cands]
         # Полосы дают лучшую геометрию. Если какой-то борт не достаёт до своей полосы,
         # переходим к разбиению сеткой с учётом радиуса действия.
@@ -307,6 +297,21 @@ class Planner:
         if w < 1.0 and len(cands) > 1:
             best = self._local_search(cands, best, angle, w)
         return best, angle
+
+    def prepare(self) -> tuple[list[Candidate], float]:
+        """Общее направление галсов и порядок бортов вдоль оси разбиения."""
+        cands = self.candidates
+        # направление галсов — по самому производительному борту
+        lead = max(cands, key=lambda c: c.productivity)
+        angle, _, _ = best_direction(self.area, lead.params.line_spacing_m, lead.drone, lead.params.speed_ms, self.req.wind)
+
+        # порядок полос ↔ положение баз вдоль оси, перпендикулярной галсам
+        def axis_key(c: Candidate) -> float:
+            b = self.bases[c.base_id or self._default_base(self.area)]
+            return strip_axis_position(b, angle)
+
+        cands.sort(key=axis_key)
+        return cands, angle
 
     def _balance(self, cands: list[Candidate], fr: list[float], angle: float, iters: int = 12) -> Evaluation:
         """Выравнивание времени окончания работ: доли корректируются по фактическому времени."""

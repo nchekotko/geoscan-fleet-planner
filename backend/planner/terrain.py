@@ -67,6 +67,12 @@ class Terrain:
                 else:
                     self.tiles[(la, lo)] = p
         self.available = bool(self.tiles) and not self.missing
+        if self.available:
+            try:
+                for p in self.tiles.values():
+                    _open(str(p))
+            except Exception:  # нет rasterio/GDAL или битый файл — работаем без рельефа
+                self.available = False
 
     def heights(self, lonlat: list[tuple[float, float]]) -> np.ndarray:
         out = np.full(len(lonlat), np.nan)

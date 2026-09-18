@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from planner.export import drone_geojson, drone_kml, plan_zip
 from planner.fleet import load_fleet
@@ -105,3 +107,9 @@ def export_all(plan_id: str) -> Response:
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="plan_{plan_id}.zip"'},
     )
+
+
+# Собранный интерфейс (в Docker — /app/static). Монтируется последним, чтобы не перекрывать /api.
+_static = Path(os.environ.get("STATIC_DIR", Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"))
+if _static.is_dir():
+    app.mount("/", StaticFiles(directory=_static, html=True), name="web")
