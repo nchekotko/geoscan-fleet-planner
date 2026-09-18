@@ -8,16 +8,26 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
 
+from shapely.geometry import shape
+
+from .geo import LocalFrame
 from .planner import plan
 from .schemas import PlanRequest, PlanResponse
 
 DEFAULT_WEIGHTS = (1.0, 0.9, 0.75, 0.6, 0.45, 0.3, 0.15, 0.0)
+LARGE_AREA_KM2 = 20.0
 
 
-def _solve(args: tuple[dict, float]) -> PlanResponse | None:
-    data, w = args
+def _area_km2(req: PlanRequest) -> float:
+    g = shape(req.survey_area)
+    return LocalFrame.around(g).to_local(g).area / 1e6
+
+
+def _solve(args: tuple[dict, float, float | None]) -> PlanResponse | None:
+    data, w, cap = args
     req = PlanRequest(**data)
     req.time_weight = w
+    req.makespan_cap_s = cap
     try:
         return plan(req)
     except ValueError:
@@ -35,12 +45,28 @@ def non_dominated(plans: list[PlanResponse]) -> list[PlanResponse]:
     return front
 
 
-def pareto_front(req: PlanRequest, weights=DEFAULT_WEIGHTS, workers: int | None = None) -> list[PlanResponse]:
-    data = req.model_dump()
-    jobs = [(data, w) for w in weights]
+def _run(jobs, workers):
     if workers == 1:
-        results = [_solve(j) for j in jobs]
-    else:
-        with ProcessPoolExecutor(max_workers=workers or min(len(jobs), 6)) as ex:
-            results = list(ex.map(_solve, jobs))
-    return non_dominated([r for r in results if r is not None])
+        return [_solve(j) for j in jobs]
+    with ProcessPoolExecutor(max_workers=workers or min(len(jobs), 6)) as ex:
+        return list(ex.map(_solve, jobs))
+
+
+def pareto_front(
+    req: PlanRequest, weights=DEFAULT_WEIGHTS, workers: int | None = None, eps_points: int = 5
+) -> list[PlanResponse]:
+    """Взвешенная сумма даёт выпуклую часть фронта; метод ε-ограничений (Mavrotas, 2009)
+    добирает точки между крайними планами: min ΣT при T_max ≤ ε."""
+    data = req.model_dump()
+    if _area_km2(req) > LARGE_AREA_KM2 and weights is DEFAULT_WEIGHTS:
+        # большие области считаются в сеточном режиме дольше — берём меньше точек
+        weights, eps_points = (1.0, 0.5, 0.0), min(eps_points, 2)
+    results = _run([(data, w, None) for w in weights], workers)
+    ok = [r for r in results if r is not None]
+    if len(ok) >= 2 and eps_points > 0:
+        t_lo = min(r.summary.makespan_s for r in ok)
+        t_hi = max(r.summary.makespan_s for r in ok)
+        if t_hi > t_lo * 1.02:
+            caps = [t_lo + (t_hi - t_lo) * k / (eps_points + 1) for k in range(1, eps_points + 1)]
+            ok += [r for r in _run([(data, 1.0, c) for c in caps], workers) if r is not None]
+    return non_dominated(ok)

@@ -36,6 +36,8 @@ class PlanRequest(BaseModel):
     wind: Wind = Field(default_factory=Wind)
     # 1.0 — минимизация времени выполнения работ, 0.0 — минимизация суммарного налёта
     time_weight: float = Field(1.0, ge=0.0, le=1.0)
+    # ε-ограничение: минимизировать суммарный налёт при времени работ ≤ makespan_cap_s (фронт Парето)
+    makespan_cap_s: float | None = None
     reserve: float = Field(0.2, ge=0.0, le=0.6)
     nfz_buffer_m: float = 30.0
     use_terrain: bool = True  # рельеф Copernicus DEM GLO-30

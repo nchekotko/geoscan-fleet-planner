@@ -91,18 +91,16 @@ def order_passes(passes: list[Pass], start: tuple[float, float], kind: str = "su
     if not passes:
         return []
     cells = boustrophedon_cells(passes)
+    # возможные точки входа в ячейку: концы первого и последнего галса
+    entries = [(c[0].a, c[0].b, c[-1].a, c[-1].b) for c in cells]
     route: list[DirectedPass] = []
     pos = start
-    left = list(range(len(cells)))
+    left = set(range(len(cells)))
     while left:
-        best_i, best_seq, best_d = -1, [], math.inf
-        for i in left:
-            seq = _snake(cells[i], pos, kind)
-            d = math.dist(pos, seq[0].a)
-            if d < best_d:
-                best_i, best_seq, best_d = i, seq, d
-        route += best_seq
-        pos = best_seq[-1].b
+        best_i = min(left, key=lambda i: (min(math.dist(pos, e) for e in entries[i]), i))
+        seq = _snake(cells[best_i], pos, kind)
+        route += seq
+        pos = seq[-1].b
         left.remove(best_i)
     return route
 

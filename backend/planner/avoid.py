@@ -88,7 +88,12 @@ class Router:
         return ok
 
     def polyline_free(self, pts: list[Pt]) -> bool:
-        return all(self.visible(a, b) for a, b in zip(pts, pts[1:]))
+        if len(pts) < 2:
+            return True
+        line = LineString(pts)
+        if self._core is not None and shapely.intersects(self._core, line):
+            return False
+        return self.allowed is None or bool(shapely.contains(self.allowed, line))
 
     def route(self, p: Pt, q: Pt) -> list[Pt]:
         """Точки пути p→q, включая концы. Если пути нет — прямая (проверка потом выдаст предупреждение)."""

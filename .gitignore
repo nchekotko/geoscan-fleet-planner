@@ -7,3 +7,10 @@ sources/*.png
 sources/*.html
 sources/jar.txt
 backend/data/dem/
+pres/.venv/
+pres/*.jpg
+pres/*.pdf
+pres/logos/
+pres/template.pptx
+pres/img/
+pres/unpacked/

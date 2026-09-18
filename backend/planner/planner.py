@@ -294,7 +294,10 @@ class Planner:
             )
             best = self._balance(cands, fr, angle)
         w = self.req.time_weight
-        if w < 1.0 and len(cands) > 1:
+        cap = self.req.makespan_cap_s
+        if cap is not None and len(cands) > 1:
+            best = self._local_search(cands, best, angle, 0.0, cap=cap)
+        elif w < 1.0 and len(cands) > 1:
             best = self._local_search(cands, best, angle, w)
         return best, angle
 
@@ -317,9 +320,11 @@ class Planner:
         """Выравнивание времени окончания работ: доли корректируются по фактическому времени.
         Мультистарт: доли по производительности и равные доли, берётся лучший результат."""
         results = []
-        for start in (fr, [1.0] * len(fr)):
+        for k, start in enumerate((fr, [1.0] * len(fr))):
+            # сетка дорогая: второй старт (равные доли) — только одна оценка, без итераций
+            n_it = 0 if (self.mode == "grid" and k == 1) else iters
             try:
-                results.append(self._balance_from(cands, start, angle, iters))
+                results.append(self._balance_from(cands, start, angle, n_it))
             except ValueError:
                 if not results and start is not fr:
                     raise
@@ -331,7 +336,7 @@ class Planner:
         best = self.evaluate(cands, fr, angle)
         cur = best
         for it in range(iters):
-            if self.mode == "grid" and it >= 6:
+            if self.mode == "grid" and it >= 4:
                 break  # сеточное разбиение дороже, хватает нескольких итераций
             times = [r.finish_s for r in cur.results]
             mean = sum(times) / len(times)
@@ -348,11 +353,16 @@ class Planner:
                 best = cur
         return best
 
-    def _local_search(self, cands: list[Candidate], start: Evaluation, angle: float, w: float) -> Evaluation:
+    def _local_search(
+        self, cands: list[Candidate], start: Evaluation, angle: float, w: float, cap: float | None = None
+    ) -> Evaluation:
         t_ref, s_ref = start.makespan, start.total
 
         def score(e: Evaluation) -> float:
-            return w * e.makespan / t_ref + (1 - w) * e.total / s_ref
+            j = w * e.makespan / t_ref + (1 - w) * e.total / s_ref
+            if cap is not None and e.makespan > cap:
+                j += 10.0 * (e.makespan - cap) / t_ref  # штраф за нарушение ε-ограничения
+            return j
 
         best, best_j = start, score(start)
         # дополнительные стартовые точки: вся работа одному борту
@@ -369,7 +379,7 @@ class Planner:
         n = len(cands)
         step = 0.5
         evals = 0
-        max_evals = 40 if self.mode == "grid" else 200
+        max_evals = 16 if self.mode == "grid" else 200
         while step > 0.05 and evals < max_evals:
             improved = False
             for i in range(n):
