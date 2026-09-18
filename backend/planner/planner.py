@@ -678,7 +678,7 @@ class Planner:
                 all_pts = [p for leg in s.legs for p in self._dense(leg.points, 100.0)]
                 level = max(self._ground(terrain, all_pts) + [base_ground]) + agl
                 for i, leg in enumerate(s.legs):
-                    alt = [base_ground if leg.kind in ("takeoff", "landing") and k == 0 else level
+                    alt = [base_ground if _on_ground(leg.kind, k, len(leg.points)) else level
                            for k in range(len(leg.points))]
                     out[(s.index, i)] = (leg.points, alt)
                 continue
@@ -688,7 +688,8 @@ class Planner:
                     out[(s.index, i)] = (pts, [g + agl for g in self._ground(terrain, pts)])
                 elif leg.kind in ("takeoff", "landing"):
                     g = self._ground(terrain, leg.points[:1])[0]
-                    out[(s.index, i)] = (leg.points, [g] + [g + agl] * (len(leg.points) - 1))
+                    n = len(leg.points)
+                    out[(s.index, i)] = (leg.points, [g if _on_ground(leg.kind, k, n) else g + agl for k in range(n)])
                 else:
                     level = max(self._ground(terrain, self._dense(leg.points, 100.0))) + agl
                     out[(s.index, i)] = (leg.points, [level] * len(leg.points))
@@ -709,11 +710,12 @@ class Planner:
                     pts, alts = amsl.get((s.index, li), (l.points, None))
                     legs.append(LegOut(
                         kind=l.kind,
-                        coordinates=[[*f.xy_to_lonlat(x, y), 0.0 if l.kind in ("takeoff", "landing") and i == 0 else l.alt_agl]
+                        coordinates=[[*f.xy_to_lonlat(x, y), 0.0 if _on_ground(l.kind, i, len(pts)) else l.alt_agl]
                                      for i, (x, y) in enumerate(pts)],
                         alt_amsl=[round(a, 1) for a in alts] if alts else None,
                         duration_s=round(l.duration_s, 1),
                         distance_m=round(l.distance_m, 1),
+                        speed_ms=round(l.speed_ms, 2),
                     ))
                 sorties_out.append(
                     SortieOut(index=s.index, base_id=s.base_id, start_s=round(s.start_s, 1),
@@ -768,6 +770,8 @@ class Planner:
             time_weight=self.req.time_weight,
             reserve_sites=self.req.reserve_sites,
             bases=self.req.bases,
+            no_fly_zones=self.req.no_fly_zones,
+            allowed_area=self.req.allowed_area,
             terrain=self._terrain_info(terrain),
         )
 
@@ -778,6 +782,11 @@ class Planner:
                                               else [c for p in self.area.geoms for c in p.exterior.coords], 200.0))
         return TerrainInfo(source="Copernicus DEM GLO-30 (DSM, EGM2008)", ground_min_m=round(min(g), 1),
                            ground_max_m=round(max(g), 1))
+
+
+def _on_ground(kind: str, k: int, n: int) -> bool:
+    """Точка участка на земле: начало взлёта (земля → высота) и конец посадки (высота → земля)."""
+    return (kind == "takeoff" and k == 0) or (kind == "landing" and k == n - 1)
 
 
 def plan(req: PlanRequest) -> PlanResponse:

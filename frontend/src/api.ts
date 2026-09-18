@@ -44,8 +44,10 @@ export interface PlanRequest {
 export interface Leg {
   kind: 'takeoff' | 'transit' | 'survey' | 'tie' | 'turn' | 'return' | 'landing'
   coordinates: number[][]
+  alt_amsl?: number[] | null
   duration_s: number
   distance_m: number
+  speed_ms: number
 }
 
 export interface Sortie {
@@ -99,6 +101,8 @@ export interface PlanResponse {
   warnings: string[]
   working_area: Geometry
   time_weight: number
+  no_fly_zones: Geometry[]
+  allowed_area: Geometry | null
 }
 
 export interface DroneModel {

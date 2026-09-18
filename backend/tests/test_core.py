@@ -479,3 +479,101 @@ def test_no_terrain_gives_warning(monkeypatch):
     res = plan(load_req())
     assert res.terrain is None
     assert any("рельеф недоступен" in w for w in res.warnings)
+
+
+# --- ключевые точки экспорта ------------------------------------------------------
+from planner.export import drone_geojson, drone_kml, waypoints  # noqa: E402
+
+KML_NS = "{http://www.opengis.net/kml/2.2}"
+
+
+def test_landing_ends_on_ground():
+    """Взлёт: земля → высота, посадка: высота → земля (AGL и абсолютные высоты)."""
+    res = plan(load_req())
+    for d in res.drones:
+        for s in d.sorties:
+            to, ld = s.legs[0], s.legs[-1]
+            assert (to.kind, ld.kind) == ("takeoff", "landing")
+            assert to.coordinates[0][2] == 0 and to.coordinates[-1][2] > 0
+            assert ld.coordinates[0][2] > 0 and ld.coordinates[-1][2] == 0
+            if ld.alt_amsl:
+                assert ld.alt_amsl[-1] == to.alt_amsl[0] < ld.alt_amsl[0]
+
+
+def test_leg_speeds():
+    res = plan(load_req())
+    for d in res.drones:
+        for s in d.sorties:
+            for leg in s.legs:
+                if leg.kind in ("survey", "tie", "turn"):
+                    assert leg.speed_ms == pytest.approx(d.params.speed_ms, abs=0.01)
+                elif leg.kind in ("transit", "return"):
+                    assert leg.speed_ms >= d.params.speed_ms - 0.01
+                else:
+                    assert 0 < leg.speed_ms < 10  # вертикальная скорость
+
+
+@pytest.mark.parametrize("name", ["large_mixed_fleet", "demo_basic"])
+def test_waypoints_avoid_nfz_and_start_end_on_ground(name):
+    req = scenario(name)
+    res = plan(req)
+    nfz = [shape(z) for z in req.no_fly_zones]
+    assert nfz and res.no_fly_zones == req.no_fly_zones and res.allowed_area == req.allowed_area
+    for d in res.drones:
+        wps = waypoints(d, res)
+        assert [w["seq"] for w in wps] == list(range(1, len(wps) + 1))
+        base = next(b for b in res.bases if b.id == d.sorties[0].base_id)
+        for s in d.sorties:
+            sw = [w for w in wps if w["sortie"] == s.index + 1]
+            assert sw[0]["action"] == "takeoff" and sw[-1]["action"] == "land"
+            for w in (sw[0], sw[-1]):
+                assert w["altitude_agl_m"] == 0
+                assert w["coord"][:2] == pytest.approx([base.lon, base.lat], abs=1e-7)
+            # длительности участков округлены до 0,1 с
+            assert sw[-1]["eta_s"] == pytest.approx(s.duration_s, abs=0.05 * len(s.legs) + 0.2)
+            assert all(a["eta_s"] <= b["eta_s"] for a, b in zip(sw, sw[1:]))
+            assert {"survey_start", "survey_end"} <= {w["action"] for w in sw}
+            for a, b in zip(sw, sw[1:]):
+                assert a["coord"] != b["coord"] or a["altitude_amsl_m"] != b["altitude_amsl_m"]
+                seg = LineString([a["coord"][:2], b["coord"][:2]])
+                assert not any(seg.intersects(z) for z in nfz), (d.drone_id, a["seq"])
+            for w in sw:
+                if w["phase"] in ("transit", "return"):
+                    assert w["speed_ms"] >= d.params.speed_ms - 0.01
+
+
+def test_exports_carry_keypoints_speeds_and_constraints():
+    req = scenario("large_mixed_fleet")
+    res = plan(req)
+    d = res.drones[0]
+    gj = drone_geojson(d, res)
+    kinds = [f["properties"]["kind"] for f in gj["features"]]
+    assert kinds.count("no_fly_zone") == len(req.no_fly_zones) and "allowed_area" in kinds
+    legs = [f["properties"] for f in gj["features"] if f["properties"]["kind"] == "leg"]
+    assert {"takeoff", "landing"} <= {p["phase"] for p in legs}
+    assert all(p["speed_ms"] > 0 for p in legs)
+    wp = [f["properties"] for f in gj["features"] if f["properties"]["kind"] == "waypoint"]
+    assert all({"seq", "phase", "action", "speed_ms", "eta_s", "altitude_agl_m"} <= p.keys() for p in wp)
+    root = ET.fromstring(drone_kml(d, res).encode("utf-8"))
+    folders = {}
+    for f in root.iter(f"{KML_NS}Folder"):
+        folders.setdefault(f.findtext(f"{KML_NS}name"), []).append(f)
+    assert "Ограничения" in folders and len(folders["Ключевые точки"]) == len(d.sorties)
+    pts = [p for f in folders["Ключевые точки"] for p in f.findall(f"{KML_NS}Placemark")]
+    assert len(pts) == len(wp)
+    data = {e.get("name") for e in pts[0].iter(f"{KML_NS}Data")}
+    assert {"phase", "speed_ms", "altitude_agl_m", "altitude_amsl_m", "eta_s"} <= data
+    speeds = {e.findtext(f"{KML_NS}value") for f in root.iter(f"{KML_NS}Placemark")
+              if f.find(f"{KML_NS}LineString") is not None for e in f.iter(f"{KML_NS}Data")
+              if e.get("name") == "speed_ms"}
+    assert speeds and all(float(v) > 0 for v in speeds)
+
+
+@pytest.mark.parametrize("name", ["demo_basic", "lidar_401", "geophysics_401"])
+def test_every_leg_has_speed(name):
+    """У каждого участка своя скорость — и при жадной нарезке, и при точной (Split)."""
+    res = plan(scenario(name, use_terrain=False))
+    for d in res.drones:
+        for s in d.sorties:
+            for leg in s.legs:
+                assert leg.speed_ms > 0, (d.drone_id, s.index, leg.kind)
