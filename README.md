@@ -33,6 +33,12 @@ npm run dev -- --host 127.0.0.1
 
 Интерфейс: http://127.0.0.1:5173. API и OpenAPI: http://127.0.0.1:8000/docs.
 
+## Данные и атрибуция
+
+- Подложка карты — © участники OpenStreetMap (ODbL), тайлы по [Tile Usage Policy](https://operations.osmfoundation.org/policies/tiles/).
+- Рельеф — Copernicus DEM GLO-30: © DLR e.V. 2010–2014 и © Airbus Defence and Space GmbH 2014–2018, предоставлено в рамках COPERNICUS Европейским союзом и ESA.
+- ТТХ бортов — паспорта и руководства Геоскан (ссылки в `backend/data/fleet.yaml` и PLAN.md).
+
 ## Документация
 
 - [Архитектура](docs/architecture.md)

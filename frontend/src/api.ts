@@ -107,6 +107,7 @@ export interface PlanResponse {
   time_weight: number
   no_fly_zones: Geometry[]
   allowed_area: Geometry | null
+  terrain?: { source: string; ground_min_m: number; ground_max_m: number } | null
   /** ограничение на время работ (метод ε-ограничений); есть не во всех версиях API */
   makespan_cap_s?: number | null
 }

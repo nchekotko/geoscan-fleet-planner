@@ -14,6 +14,11 @@ from pathlib import Path
 
 import numpy as np
 
+# Атрибуция по условиям лицензии Copernicus DEM
+TERRAIN_ATTRIBUTION = (
+    "Copernicus DEM GLO-30 (DSM, EGM2008): © DLR e.V. 2010–2014 и © Airbus Defence and Space GmbH "
+    "2014–2018, предоставлено в рамках COPERNICUS Европейским союзом и ESA"
+)
 DEM_DIR = Path(os.environ.get("DEM_DIR", Path(__file__).resolve().parent.parent / "data" / "dem"))
 URL = "https://copernicus-dem-30m.s3.amazonaws.com/{name}/{name}.tif"
 

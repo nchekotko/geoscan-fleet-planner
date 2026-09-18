@@ -662,6 +662,11 @@ export default function App() {
             </table>
             <p className="hint">* Уход — худшее время до ближайшей ВПП или резервной площадки с посадкой.</p>
             <ExportLink className="button" stale={stale} href={api.zipUrl(plan.plan_id)}>Скачать все задания (ZIP)</ExportLink>
+            {plan.terrain && (
+              <p className="hint">
+                Рельеф {plan.terrain.ground_min_m.toFixed(0)}–{plan.terrain.ground_max_m.toFixed(0)} м. {plan.terrain.source}
+              </p>
+            )}
             {plan.excluded.length > 0 && (
               <ul className="excluded">
                 {plan.excluded.map((e) => (

@@ -35,7 +35,7 @@ from .energy import check_wind, usable_flight_time_s
 from .fleet import DroneModel, Payload, load_fleet
 from .geo import LocalFrame
 from .mission import Sortie, SortieBuilder, order_passes, schedule
-from .terrain import Terrain
+from .terrain import TERRAIN_ATTRIBUTION, Terrain
 from .turns import turn_overshoot
 from .grid_partition import grid_partition
 from .mission import FIXED_WING_LANDING_S, FIXED_WING_TAKEOFF_S, LAUNCH_INTERVAL_S, MULTIROTOR_DESCENT_MS
@@ -1072,7 +1072,7 @@ class Planner:
             return None
         g = self._ground(terrain, self._dense(list(self.area.exterior.coords) if isinstance(self.area, Polygon)
                                               else [c for p in self.area.geoms for c in p.exterior.coords], 200.0))
-        return TerrainInfo(source="Copernicus DEM GLO-30 (DSM, EGM2008)", ground_min_m=round(min(g), 1),
+        return TerrainInfo(source=TERRAIN_ATTRIBUTION, ground_min_m=round(min(g), 1),
                            ground_max_m=round(max(g), 1))
 
 
