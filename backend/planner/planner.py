@@ -147,7 +147,11 @@ class Planner:
             raise PlanningError("не задано ни одного взлётно-посадочного пункта")
         self.candidates = self._candidates()
         if not self.candidates:
-            raise PlanningError("ни один борт не может выполнить съёмку этого типа в заданных условиях")
+            reasons = "; ".join(f"{e.drone_id} — {e.reason}" for e in self.excluded)
+            raise PlanningError(
+                "ни один борт не может выполнить съёмку этого типа в заданных условиях"
+                + (f": {reasons}" if reasons else "")
+            )
 
     # ------------------------------------------------------------------ борта
     def _candidates(self) -> list[Candidate]:
@@ -203,12 +207,22 @@ class Planner:
             )
             v_back = max(max(params.speed_ms, drone.cruise_speed_ms) - req.wind.speed_ms, 0.5)
             reach = min(0.5 * max(budget - t_ops, 0.0) * v_back * 0.85, drone.radio_range_km * 1000)
+            # борт, который не долетает ни до одной точки области, работать не может
+            gap = self.area.distance(Point(self.bases[inst.base_id or self._default_base(self.area)]))
+            if gap >= reach:
+                self.excluded.append(ExcludedDrone(
+                    drone_id=inst.id,
+                    reason=f"{drone.name}: не долетает до области: ближайшая точка {gap / 1000:.1f} км, "
+                           f"радиус действия {reach / 1000:.1f} км",
+                ))
+                continue
             out.append(Candidate(inst.id, drone, payload, params, budget, inst.base_id, productivity, reach))
         return out
 
     # ------------------------------------------------------------- оценка
     def _default_base(self, region: BaseGeometry) -> str:
-        c = region.centroid
+        """Ближайшая к центру участка база (для пустого участка — к центру всей области)."""
+        c = (region if not region.is_empty else self.area).centroid
         return min(self.bases, key=lambda b: math.dist(self.bases[b], (c.x, c.y)))
 
     def _reassign_turn_gaps(
@@ -446,11 +460,15 @@ class Planner:
             if self.mode == "grid" and it >= 4:
                 break  # сеточное разбиение дороже, хватает нескольких итераций
             times = [r.finish_s for r in cur.results]
+            if not times or len(times) != len(cur.fractions):
+                break  # есть борта без участка — доли и времена не сопоставить
             mean = sum(times) / len(times)
             if max(times) - min(times) < 0.02 * mean:
                 break
             fr = [f * (mean / max(t, 1.0)) ** 0.8 for f, t in zip(cur.fractions, times)]
             s = sum(fr)
+            if s <= 0:
+                break
             fr = [f / s for f in fr]
             try:
                 cur = self.evaluate(cands, fr, angle)

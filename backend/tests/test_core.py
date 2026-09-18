@@ -182,6 +182,118 @@ def test_api_rejects_empty_area():
     assert c.post("/api/plan", json=body).status_code == 422
 
 
+def _demo_body(**over) -> dict:
+    body = json.loads(SCENARIO.read_text(encoding="utf-8"))
+    body["use_terrain"] = False
+    body.update(over)
+    return body
+
+
+def _far_body(dlat: float = 0.072) -> dict:
+    """demo_basic с областью, сдвинутой на север (0,072° ≈ 8 км): мультироторы не долетают."""
+    body = _demo_body(no_fly_zones=[])
+    ring = body["survey_area"]["coordinates"][0]
+    body["survey_area"]["coordinates"][0] = [[lon, lat + dlat] for lon, lat in ring]
+    return body
+
+
+def _bad_inputs() -> list[tuple[str, dict]]:
+    def req(overlap=None, **over):
+        b = _demo_body(**over)
+        if overlap is not None:
+            b["requirements"] = {**b["requirements"], **overlap}
+        return b
+
+    area = _demo_body()["survey_area"]
+    bow = {"type": "Polygon", "coordinates": [[[37.60, 55.60], [37.64, 55.62], [37.64, 55.60], [37.60, 55.62], [37.60, 55.60]]]}
+    return [
+        ("overlap=1", req({"side_overlap": 1.0})),
+        ("front_overlap=1", req({"front_overlap": 1.0})),
+        ("gsd=0", req({"gsd_cm": 0})),
+        ("NaN в ветре", req(wind={"speed_ms": float("nan"), "from_deg": 0})),
+        ("ветер 100 м/с", req(wind={"speed_ms": 100, "from_deg": 0})),
+        ("lat=95", req(bases=[{"id": "A", "lon": 37.6, "lat": 95}])),
+        ("самопересечение", req(survey_area=bow, no_fly_zones=[])),
+        ("пустой полигон", req(survey_area={"type": "Polygon", "coordinates": []})),
+        ("вырожденный полигон", req(survey_area={"type": "Polygon", "coordinates": [[[37.6, 55.6], [37.61, 55.6], [37.6, 55.6], [37.6, 55.6]]]})),
+        ("не полигон", req(survey_area={"type": "Point", "coordinates": [37.6, 55.6]})),
+        ("NFZ-линия", req(no_fly_zones=[{"type": "LineString", "coordinates": [[37.6, 55.6], [37.61, 55.61]]}])),
+        ("повтор id бортов", req(drones=[{"id": "x", "model": "geoscan_201"}, {"id": "x", "model": "geoscan_gemini"}])),
+        ("повтор id баз", req(bases=[{"id": "A", "lon": 37.605, "lat": 55.595}, {"id": "A", "lon": 37.65, "lat": 55.61}])),
+        ("отрицательный буфер", req(nfz_buffer_m=-50)),
+        ("неизвестная модель", req(drones=[{"id": "x", "model": "nope"}])),
+        ("неизвестная база", req(drones=[{"id": "x", "model": "geoscan_201", "base_id": "Z"}])),
+        ("нет бортов", req(drones=[])),
+        ("нет баз", req(bases=[])),
+        ("reserve=0.9", req(reserve=0.9)),
+        ("область на другом краю света", req(survey_area={**area, "coordinates": [[[lon - 150, lat] for lon, lat in area["coordinates"][0]]]}, no_fly_zones=[])),
+        ("далёкая область", _far_body(0.072)),
+        ("очень далёкая область", _far_body(1.0)),
+    ]
+
+
+@pytest.mark.parametrize("name,body", _bad_inputs(), ids=[n for n, _ in _bad_inputs()])
+def test_api_never_500_on_bad_input(name, body):
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.post("/api/plan", content=json.dumps(body), headers={"Content-Type": "application/json"})
+    assert r.status_code in (200, 422), f"{name}: {r.status_code} {r.text[:300]}"
+    if r.status_code == 422:
+        assert isinstance(r.json()["detail"], str) and r.json()["detail"]
+
+
+def test_far_area_fixed_wing_only():
+    """Область в ~8 км от баз: мультироторы исключены с указанием расстояния, снимает самолёт."""
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.post("/api/plan", json=_far_body(0.072))
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert {d["model"] for d in data["drones"]} == {"geoscan_201"}
+    assert data["summary"]["coverage_pct"] > 99
+    far = [e for e in data["excluded"] if "не долетает до области" in e["reason"]]
+    assert {e["drone_id"] for e in far} == {"gemini-1", "gemini-2", "801-1"}
+    assert all("км" in e["reason"] for e in far)
+    # никто не долетает — 422 с причинами по каждому борту
+    r = c.post("/api/plan", json=_far_body(1.0))
+    assert r.status_code == 422
+    assert "не долетает до области" in r.json()["detail"] and "201-1" in r.json()["detail"]
+
+
+def test_self_intersecting_area_is_repaired_or_rejected():
+    body = _demo_body(no_fly_zones=[], survey_area={
+        "type": "Polygon",
+        "coordinates": [[[37.60, 55.60], [37.64, 55.62], [37.64, 55.60], [37.60, 55.62], [37.60, 55.60]]],
+    })
+    req = PlanRequest(**body)
+    assert shape(req.survey_area).is_valid and shape(req.survey_area).area > 0
+
+
+def test_unexpected_error_is_json_500(monkeypatch):
+    import api.main as api_main
+
+    def boom(req):
+        raise RuntimeError("сбой")
+
+    monkeypatch.setattr(api_main, "plan", boom)
+    r = TestClient(app, raise_server_exceptions=False).post("/api/plan", json=_demo_body())
+    assert r.status_code == 500
+    assert "внутренняя ошибка" in r.json()["detail"]
+
+
+def test_export_cyrillic_drone_id():
+    c = TestClient(app)
+    body = _demo_body(drones=[{"id": "Борт-1", "model": "geoscan_201", "base_id": "A"}])
+    r = c.post("/api/plan", json=body)
+    assert r.status_code == 200, r.text
+    pid = r.json()["plan_id"]
+    for fmt in ("geojson", "kml"):
+        e = c.get(f"/api/plan/{pid}/export/Борт-1.{fmt}")
+        assert e.status_code == 200
+        cd = e.headers["content-disposition"]
+        cd.encode("latin-1")  # заголовок передаётся без ошибок кодировки
+        assert f"filename*=UTF-8''%D0%91%D0%BE%D1%80%D1%82-1.{fmt}" in cd
+        assert f'filename="____-1.{fmt}"' in cd
+
+
 def test_slow_survey_in_strong_wind_is_excluded_not_crashing():
     res_req = load_req(survey_type="thermal", drones=[{"id": "a", "model": "geoscan_801"}, {"id": "b", "model": "geoscan_gemini"}])
     with pytest.raises(ValueError, match="ни один борт"):

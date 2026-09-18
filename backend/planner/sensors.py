@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from .fleet import DroneModel, Payload
 
@@ -18,13 +18,15 @@ from .fleet import DroneModel, Payload
 class SurveyRequirements(BaseModel):
     """Требования к съёмке, которые задаёт пользователь. Пустые поля — значения по умолчанию."""
 
-    gsd_cm: float | None = 3.0           # камеры
-    front_overlap: float = 0.75
-    side_overlap: float = 0.65
-    altitude_m: float | None = None      # явная высота AGL, перекрывает расчёт из GSD
-    lidar_density_pts_m2: float = 50.0
-    line_spacing_m: float | None = None  # геофизика
-    altitude_ceiling_m: float | None = None  # потолок разрешённого объёма (AGL)
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    gsd_cm: float | None = Field(3.0, gt=0.0)           # камеры
+    front_overlap: float = Field(0.75, ge=0.0, le=0.95)
+    side_overlap: float = Field(0.65, ge=0.0, le=0.95)
+    altitude_m: float | None = Field(None, ge=0.0)      # явная высота AGL, перекрывает расчёт из GSD
+    lidar_density_pts_m2: float = Field(50.0, gt=0.0)
+    line_spacing_m: float | None = Field(None, gt=0.0)  # геофизика
+    altitude_ceiling_m: float | None = Field(None, ge=0.0)  # потолок разрешённого объёма (AGL)
 
 
 class SurveyParams(BaseModel):
