@@ -314,7 +314,20 @@ class Planner:
         return cands, angle
 
     def _balance(self, cands: list[Candidate], fr: list[float], angle: float, iters: int = 12) -> Evaluation:
-        """Выравнивание времени окончания работ: доли корректируются по фактическому времени."""
+        """Выравнивание времени окончания работ: доли корректируются по фактическому времени.
+        Мультистарт: доли по производительности и равные доли, берётся лучший результат."""
+        results = []
+        for start in (fr, [1.0] * len(fr)):
+            try:
+                results.append(self._balance_from(cands, start, angle, iters))
+            except ValueError:
+                if not results and start is not fr:
+                    raise
+        if not results:
+            raise ValueError("не удалось построить план ни из одной стартовой точки")
+        return min(results, key=lambda e: e.makespan)
+
+    def _balance_from(self, cands: list[Candidate], fr: list[float], angle: float, iters: int) -> Evaluation:
         best = self.evaluate(cands, fr, angle)
         cur = best
         for it in range(iters):
@@ -342,6 +355,17 @@ class Planner:
             return w * e.makespan / t_ref + (1 - w) * e.total / s_ref
 
         best, best_j = start, score(start)
+        # дополнительные стартовые точки: вся работа одному борту
+        for i in range(len(cands)):
+            fr = [1.0 if k == i else 0.0 for k in range(len(cands))]
+            try:
+                e = self.evaluate(cands, fr, angle)
+            except (ValueError, GEOSException):
+                continue
+            if e.unreachable_m2 > best.unreachable_m2 + 1.0:
+                continue  # один борт не достаёт до всей области — не считаем решением
+            if score(e) < best_j - 1e-6:
+                best, best_j = e, score(e)
         n = len(cands)
         step = 0.5
         evals = 0
