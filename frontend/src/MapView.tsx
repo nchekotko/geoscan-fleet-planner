@@ -63,7 +63,7 @@ export default function MapView({ req, plan, stale, drawMode, onDrawn, editing, 
 
   useEffect(() => {
     if (!el.current || map.current) return
-    const m = L.map(el.current, { center: [55.61, 37.62], zoom: 13 })
+    const m = L.map(el.current, { center: [55.61, 37.62], zoom: 13, zoomSnap: 0.25, zoomDelta: 0.5 })
     // OSM: атрибуция обязательна (Tile Usage Policy)
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
@@ -203,7 +203,7 @@ export default function MapView({ req, plan, stale, drawMode, onDrawn, editing, 
     const m = map.current
     if (!m || !fit.bbox) return
     const [w, s, e, n] = fit.bbox
-    m.fitBounds(L.latLngBounds([s, w], [n, e]).pad(0.15), { maxZoom: 16 })
+    m.fitBounds(L.latLngBounds([s, w], [n, e]).pad(0.08), { maxZoom: 16 })
   }, [fit])
 
   return (
