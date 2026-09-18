@@ -42,6 +42,7 @@ npm run dev -- --host 127.0.0.1
 - [Известные ограничения](docs/limitations.md)
 - [Бенчмарк](docs/benchmark.md)
 - [План работ и первоисточники](PLAN.md)
+- Презентация: [pres/Geoscan_fleet_planner.pptx](pres/Geoscan_fleet_planner.pptx) (собирается скриптом `pres/build_deck.py` из шаблона ЛЦТ2026)
 
 ## Структура
 

@@ -19,3 +19,4 @@ sources/*.txt
 *.pptx
 !pres/*.pptx
 pres/template.pptx
+pres/deck.md
