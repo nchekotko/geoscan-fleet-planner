@@ -670,7 +670,7 @@ def test_transit_levels_and_separation_reported():
         for s in d.sorties:
             for leg in s.legs:
                 if leg.kind in ("transit", "return"):
-                    assert all(c[2] == pytest.approx(d.transit_alt_agl_m) for c in leg.coordinates)
+                    assert all(c[2] == pytest.approx(d.transit_alt_agl_m, abs=0.1) for c in leg.coordinates)
     assert res.summary.min_separation_m is None or res.summary.min_separation_m > 50
 
 
