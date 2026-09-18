@@ -13,6 +13,7 @@ from planner.coverage import best_direction, sweep_passes
 from planner.dubins import shortest_path
 from planner.energy import usable_flight_time_s
 from planner.fleet import load_fleet
+from planner.mission import SortieBuilder, order_passes
 from planner.planner import plan
 from planner.schemas import PlanRequest
 from planner.sensors import SurveyRequirements, survey_params
@@ -93,6 +94,24 @@ def test_direction_follows_long_side():
     area = box(0, 0, 3000, 300)
     ang, _, _ = best_direction(area, 50, FLEET.drones["geoscan_gemini"], 10, Wind())
     assert min(ang % math.pi, math.pi - ang % math.pi) < 0.05
+
+
+# --- нарезка на вылеты -----------------------------------------------------------
+def test_split_is_feasible_and_not_worse_than_greedy():
+    """Точная нарезка (Split): все вылеты в бюджете, галсы сняты целиком и по порядку,
+    время работы борта не больше, чем у жадной нарезки."""
+    d = FLEET.drones["geoscan_gemini"]
+    area = box(2000, -1500, 4500, 1500)
+    route = order_passes(sweep_passes(area, 0.3, 60), (0.0, 0.0))
+    b = SortieBuilder(d, 10.0, 100.0, Wind(speed_ms=5, from_deg=200), 25 * 60)
+    split = b._build_split(route, (0.0, 0.0), "A")
+    greedy = b._build_greedy(route, (0.0, 0.0), "A")
+    assert split is not None and len(split) > 1
+    assert all(s.duration_s <= b.budget + 1e-6 for s in split)
+    flown = [leg.points for s in split for leg in s.legs if leg.kind == "survey"]
+    assert flown == [[dp.a, dp.b] for dp in route]
+    assert b._finish(split) <= b._finish(greedy) + 1e-6
+    assert b._finish(b.build(route, (0.0, 0.0), "A")) == min(b._finish(split), b._finish(greedy))
 
 
 # --- планировщик ----------------------------------------------------------------

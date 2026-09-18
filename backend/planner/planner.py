@@ -41,6 +41,9 @@ from .schemas import (
 )
 from .sensors import SurveyInfeasible, SurveyParams, survey_params
 
+# Минимальный вес времени работ в критерии «налёт» (w = 0): разрешает почти равные по налёту
+# планы в пользу более быстрого.
+MIN_TIME_WEIGHT = 0.02
 
 class PlanningError(ValueError):
     pass
@@ -357,6 +360,10 @@ class Planner:
         self, cands: list[Candidate], start: Evaluation, angle: float, w: float, cap: float | None = None
     ) -> Evaluation:
         t_ref, s_ref = start.makespan, start.total
+        if cap is None:
+            # При w = 0 время работ всё же учитываем с малым весом: иначе план с налётом
+            # меньше на 1 % может оказаться вдвое дольше (всё — одному борту).
+            w = max(w, MIN_TIME_WEIGHT)
 
         def score(e: Evaluation) -> float:
             j = w * e.makespan / t_ref + (1 - w) * e.total / s_ref

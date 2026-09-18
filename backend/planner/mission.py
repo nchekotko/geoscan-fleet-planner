@@ -3,7 +3,9 @@
 
 Нарезка идёт по принципу route-first / cluster-second (Beasley, 1983): сначала строится один
 маршрут обхода всех галсов, затем он режется на вылеты так, чтобы каждый укладывался в бюджет
-(база → точка входа → галсы → база). Галс, который не помещается целиком, делится.
+(база → точка входа → галсы → база). Разрезы ищутся точно, кратчайшим путём во вспомогательном
+графе (процедура Split, Prins, 2004). Параллельно строится жадная нарезка, в которой галс,
+не помещающийся целиком, делится; берётся лучший из двух вариантов.
 """
 from __future__ import annotations
 
@@ -201,6 +203,88 @@ class SortieBuilder:
     def build(
         self, route: list[DirectedPass], base: tuple[float, float], base_id: str
     ) -> list[Sortie]:
+        """Нарезка маршрута на вылеты: точная (Split) и жадная, берётся та, у которой меньше
+        время работы борта — сумма длительностей вылетов плюс смены АКБ между ними."""
+        greedy = self._build_greedy(route, base, base_id)
+        split = self._build_split(route, base, base_id)
+        if split is not None and self._finish(split) < self._finish(greedy) - 1e-6:
+            return split
+        return greedy
+
+    def _finish(self, sorties: list[Sortie]) -> float:
+        swap = self.drone.swap_time_min * 60
+        return sum(s.duration_s for s in sorties) + swap * max(0, len(sorties) - 1)
+
+    def _build_split(
+        self, route: list[DirectedPass], base: tuple[float, float], base_id: str
+    ) -> list[Sortie] | None:
+        """Процедура Split (Prins, 2004). Узлы — концы галсов 0..n, ребро i→j — вылет, который
+        снимает галсы i..j-1 целиком: взлёт, подход к галсу i, галсы с разворотами, возврат
+        с конца галса j-1, посадка. Ребро есть, только если вылет укладывается в бюджет; вес —
+        длительность вылета плюс смена АКБ. Кратчайший путь 0→n даёт оптимальные разрезы при
+        заданном порядке галсов. Галсы здесь не делятся: если какой-то галс не помещается даже
+        в отдельный вылет, возвращается None, и остаётся жадная нарезка."""
+        n = len(route)
+        if n == 0:
+            return None
+        swap = self.drone.swap_time_min * 60
+        take, land = self.takeoff_s(), self.landing_s()
+        pass_t = [self.fly_time(dp.a, dp.b, self.speed) for dp in route]
+        # разворот от конца галса k-1 к началу галса k внутри вылета
+        inner = [None] + [self.approach(route[k - 1].b, route[k - 1].heading, route[k]) for k in range(1, n)]
+        first: dict[int, tuple] = {}   # подход от базы к галсу i
+        back: dict[int, tuple] = {}    # возврат с конца галса j на базу — по мере надобности
+        best = [math.inf] * (n + 1)
+        prev = [-1] * (n + 1)
+        best[0] = -swap                # перед первым вылетом смены АКБ нет
+        for i in range(n):
+            if best[i] == math.inf:
+                continue
+            first[i] = self.approach(base, None, route[i])
+            t = take + first[i][2]
+            for j in range(i, n):
+                if j > i:
+                    t += inner[j][2]
+                t += pass_t[j]
+                if t + land > self.budget:
+                    break              # время только растёт — более длинные вылеты недопустимы
+                if j not in back:
+                    pts = self.path(route[j].b, base)
+                    back[j] = (pts, self.path_time(pts, self.transit_speed))
+                dur = t + back[j][1] + land
+                if dur <= self.budget and best[i] + swap + dur < best[j + 1] - 1e-9:
+                    best[j + 1], prev[j + 1] = best[i] + swap + dur, i
+        if best[n] == math.inf:
+            return None
+        cuts: list[tuple[int, int]] = []
+        j = n
+        while j > 0:
+            cuts.append((prev[j], j))
+            j = prev[j]
+        return [self._assemble(k, route[i:j], first[i], inner[i + 1:j], pass_t[i:j], back[j - 1], base, base_id)
+                for k, (i, j) in enumerate(reversed(cuts))]
+
+    def _assemble(
+        self, index: int, passes: list[DirectedPass], first: tuple, turns: list[tuple],
+        pass_t: list[float], back: tuple, base: tuple[float, float], base_id: str,
+    ) -> Sortie:
+        """Вылет из готовых кусков: взлёт, подход, галсы с разворотами, возврат, посадка."""
+        s = Sortie(index=index, base=base, base_id=base_id)
+        s.legs.append(Leg("takeoff", [base, base], self.alt, self.takeoff_s(), 0.0))
+        for dp, app, t in zip(passes, [first, *turns], pass_t):
+            app_kind, app_pts, app_t, app_len = app
+            s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len))
+            s.legs.append(Leg(dp.kind, [dp.a, dp.b], self.alt, t, dp.length))
+        back_pts, back_t = back
+        s.legs.append(Leg("return", back_pts, self.alt, back_t, _plen(back_pts)))
+        s.legs.append(Leg("landing", [base, base], self.alt, self.landing_s(), 0.0))
+        return s
+
+    def _build_greedy(
+        self, route: list[DirectedPass], base: tuple[float, float], base_id: str
+    ) -> list[Sortie]:
+        """Жадная нарезка: вылет набирается галсами, пока хватает бюджета; галс, который
+        не помещается целиком, делится — часть в текущий вылет, остаток в следующий."""
         sorties: list[Sortie] = []
         queue = list(route)
         while queue:
