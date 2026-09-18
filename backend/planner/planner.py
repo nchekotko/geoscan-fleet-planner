@@ -878,8 +878,15 @@ class Planner:
                 all_pts = [p for leg in s.legs for p in self._dense(leg.points, 100.0)]
                 level = max(self._ground(terrain, all_pts) + [base_ground]) + agl
                 for i, leg in enumerate(s.legs):
-                    alt = [base_ground if _on_ground(leg.kind, k, len(leg.points)) else level
-                           for k in range(len(leg.points))]
+                    alt = []
+                    for k, pt in enumerate(leg.points):
+                        if _on_ground(leg.kind, k, len(leg.points)):
+                            alt.append(base_ground)
+                        elif leg.point_alts and leg.point_alts[k] < leg.alt_agl:
+                            # набор после катапульты, раскрытие парашюта — над своим рельефом
+                            alt.append(self._ground(terrain, [pt])[0] + leg.point_alts[k])
+                        else:
+                            alt.append(level)
                     out[(s.index, i)] = (leg.points, alt)
                 continue
             for i, leg in enumerate(s.legs):
@@ -912,12 +919,19 @@ class Planner:
                     pts, alts = amsl.get((s.index, li), (l.points, None))
                     # эшелон перелёта: взлёт и посадка — до него, транзит и возврат — на нём
                     lift = off if l.kind in TRANSIT_KINDS + ("takeoff", "landing") else 0.0
+
+                    def agl(i: int, l=l, n=len(pts)) -> tuple[float, float]:
+                        """Высота точки AGL и подъём на эшелон перелёта (только для точек на эшелоне)."""
+                        if _on_ground(l.kind, i, n):
+                            return 0.0, 0.0
+                        if l.point_alts and l.point_alts[i] < l.alt_agl:
+                            return l.point_alts[i], 0.0
+                        return l.alt_agl + lift, lift
+
                     legs.append(LegOut(
                         kind=l.kind,
-                        coordinates=[[*f.xy_to_lonlat(x, y), 0.0 if _on_ground(l.kind, i, len(pts)) else l.alt_agl + lift]
-                                     for i, (x, y) in enumerate(pts)],
-                        alt_amsl=[round(a + (0.0 if _on_ground(l.kind, i, len(alts)) else lift), 1)
-                                  for i, a in enumerate(alts)] if alts else None,
+                        coordinates=[[*f.xy_to_lonlat(x, y), agl(i)[0]] for i, (x, y) in enumerate(pts)],
+                        alt_amsl=[round(a + agl(i)[1], 1) for i, a in enumerate(alts)] if alts else None,
                         duration_s=round(l.duration_s, 1),
                         distance_m=round(l.distance_m, 1),
                         speed_ms=round(l.speed_ms, 2),

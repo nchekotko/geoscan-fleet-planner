@@ -733,3 +733,33 @@ def test_lidar_uses_lidar_overlap():
     p50 = survey_params(d, FLEET.payloads["agm_ms3"], SurveyRequirements(lidar_side_overlap=0.5))
     assert p20.line_spacing_m == pytest.approx(p20.swath_m * 0.8)
     assert p50.line_spacing_m < p20.line_spacing_m
+
+
+def test_fixed_wing_launch_and_landing_into_wind():
+    """Геоскан 201 при ветре: катапульта и заход на посадку против ветра, парашют раскрывается
+    с наветренной стороны ВПП на величину сноса (руководство 201: запуск и посадка против ветра)."""
+    from planner.geo import LocalFrame
+    from planner.mission import LAUNCH_RUN_M, PARACHUTE_OPEN_AGL_M, PARACHUTE_SINK_MS
+    req = load_req(time_weight=0.0, use_terrain=False)  # западный ветер 5 м/с — дует на восток
+    res = plan(req)
+    d = next(x for x in res.drones if x.model == "geoscan_201")
+    base = next(b for b in req.bases if b.id == d.sorties[0].base_id)
+    frame = LocalFrame(lon0=base.lon, lat0=base.lat)
+    for s in d.sorties:
+        take, land = s.legs[0], s.legs[-1]
+        (x0, y0), (x1, y1) = (frame.lonlat_to_xy(*c[:2]) for c in take.coordinates)
+        assert x1 - x0 == pytest.approx(-LAUNCH_RUN_M, abs=2) and abs(y1 - y0) < 2  # старт на запад
+        assert take.coordinates[0][2] == 0.0
+        pts = [frame.lonlat_to_xy(*c[:2]) for c in land.coordinates]
+        drift = 5 * PARACHUTE_OPEN_AGL_M / PARACHUTE_SINK_MS
+        assert pts[1][0] == pytest.approx(-drift, abs=2)  # раскрытие западнее ВПП на снос
+        assert pts[0][0] > pts[1][0]  # заход с подветренной (восточной) стороны
+        assert [c[2] for c in land.coordinates][1:] == [PARACHUTE_OPEN_AGL_M, 0.0]
+
+
+def test_multirotor_takeoff_stays_vertical():
+    res = plan(load_req(use_terrain=False))
+    for d in res.drones:
+        if d.model != "geoscan_201":
+            for s in d.sorties:
+                assert s.legs[0].coordinates[0][:2] == s.legs[0].coordinates[-1][:2]

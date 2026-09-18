@@ -93,7 +93,8 @@ def _action(kind: str, k: int, n: int) -> str:
     if kind == "takeoff":
         return "takeoff" if first else "climb"
     if kind == "landing":
-        return "land" if last else "approach"
+        # самолёт при ветре: заход → раскрытие парашюта → посадка
+        return "land" if last else "parachute" if (n >= 3 and k == n - 2) else "approach"
     if kind in ("survey", "tie"):
         return "survey_start" if first else "survey_end" if last else "waypoint"
     return "turn" if kind == "turn" else "waypoint"

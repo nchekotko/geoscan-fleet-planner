@@ -25,6 +25,13 @@ FIXED_WING_TAKEOFF_S = 60.0
 LAUNCH_INTERVAL_S = {"fixed_wing": 300.0, "multirotor": 120.0}
 FIXED_WING_LANDING_S = 120.0
 MULTIROTOR_DESCENT_MS = 3.0
+# Взлёт и посадка самолёта по ветру (руководство Геоскан 201: запуск и посадка строго против
+# ветра, учёт сноса на парашюте). Разгон с катапульты, заход и парашют — допущения.
+LAUNCH_RUN_M = 300.0          # прямолинейный участок после катапульты против ветра
+FINAL_APPROACH_M = 500.0      # последний прямой участок захода против ветра
+PARACHUTE_OPEN_AGL_M = 100.0  # высота раскрытия парашюта
+PARACHUTE_SINK_MS = 5.0       # скорость снижения на парашюте
+MIN_WIND_FOR_HEADING_MS = 1.0  # при более слабом ветре курс взлёта и посадки не важен
 
 
 @dataclass
@@ -40,6 +47,7 @@ class Leg:
     duration_s: float
     distance_m: float
     speed_ms: float = 0.0
+    point_alts: list[float] | None = None  # высоты точек AGL, если они разные (взлёт, посадка)
 
 
 @dataclass
@@ -132,6 +140,50 @@ class SortieBuilder:
         self.alt = alt
         self.wind = wind
         self.budget = budget_s
+        # единичный вектор «против ветра» — для катапульты и захода на посадку самолёта
+        self.upwind: tuple[float, float] | None = None
+        if drone.type == "fixed_wing" and wind.speed_ms >= MIN_WIND_FOR_HEADING_MS:
+            wx, wy = wind.vector()
+            n = math.hypot(wx, wy)
+            self.upwind = (-wx / n, -wy / n)
+
+    # --- взлёт и посадка ---------------------------------------------------------
+    def _along(self, p: tuple[float, float], d: float) -> tuple[float, float]:
+        return (p[0] + d * self.upwind[0], p[1] + d * self.upwind[1])
+
+    def launch_point(self, base: tuple[float, float]) -> tuple[float, float]:
+        """Конец разгона после катапульты: LAUNCH_RUN_M против ветра от ВПП."""
+        return self._along(base, LAUNCH_RUN_M) if self.upwind else base
+
+    def parachute_drift_m(self) -> float:
+        """Снос на парашюте: ветер × время снижения с высоты раскрытия."""
+        return self.wind.speed_ms * PARACHUTE_OPEN_AGL_M / PARACHUTE_SINK_MS
+
+    def landing_entry(self, base: tuple[float, float]) -> tuple[float, float]:
+        """Куда ведёт возврат: начало последнего прямого захода (самолёт при ветре) или ВПП."""
+        if not self.upwind:
+            return base
+        return self._along(base, self.parachute_drift_m() - FINAL_APPROACH_M)
+
+    def takeoff_leg(self, base: tuple[float, float]) -> Leg:
+        if not self.upwind:
+            return Leg("takeoff", [base, base], self.alt, self.takeoff_s(), 0.0, self.drone.climb_rate_ms)
+        end = self.launch_point(base)
+        gs = max(self.drone.cruise_speed_ms - self.wind.speed_ms, 5.0)
+        h = min(self.alt, self.drone.climb_rate_ms * LAUNCH_RUN_M / gs)
+        return Leg("takeoff", [base, end], self.alt, self.takeoff_s(), LAUNCH_RUN_M,
+                   self.drone.climb_rate_ms, point_alts=[0.0, h])
+
+    def landing_leg(self, base: tuple[float, float]) -> Leg:
+        """Посадка. Самолёт при ветре: заход против ветра до точки раскрытия парашюта (с наветренной
+        стороны на величину сноса), затем спуск на парашюте с дрейфом на ВПП."""
+        if not self.upwind:
+            return Leg("landing", [base, base], self.alt, self.landing_s(), 0.0, self.descent_ms())
+        entry = self.landing_entry(base)
+        chute = self._along(base, self.parachute_drift_m())
+        return Leg("landing", [entry, chute, base], self.alt, self.landing_s(),
+                   math.dist(entry, chute) + math.dist(chute, base), self.descent_ms(),
+                   point_alts=[self.alt, min(PARACHUTE_OPEN_AGL_M, self.alt), 0.0])
 
     # --- элементарные оценки -------------------------------------------------
     def fly_time(self, p: tuple[float, float], q: tuple[float, float], speed: float) -> float:
@@ -211,7 +263,7 @@ class SortieBuilder:
         return self.transit_speed if kind in ("transit", "return") else self.speed
 
     def return_s(self, p: tuple[float, float], base: tuple[float, float]) -> float:
-        return self.path_time(self.path(p, base), self.transit_speed) + self.landing_s()
+        return self.path_time(self.path(p, self.landing_entry(base)), self.transit_speed) + self.landing_s()
 
     # --- сборка ---------------------------------------------------------------
     def build(
@@ -254,7 +306,7 @@ class SortieBuilder:
         for i in range(n):
             if best[i] == math.inf:
                 continue
-            first[i] = self.approach(base, None, route[i])
+            first[i] = self.approach(self.launch_point(base), None, route[i])
             t = take + first[i][2]
             for j in range(i, n):
                 if j > i:
@@ -263,7 +315,7 @@ class SortieBuilder:
                 if t + land > self.budget:
                     break              # время только растёт — более длинные вылеты недопустимы
                 if j not in back:
-                    pts = self.path(route[j].b, base)
+                    pts = self.path(route[j].b, self.landing_entry(base))
                     back[j] = (pts, self.path_time(pts, self.transit_speed))
                 dur = t + back[j][1] + land
                 if dur <= self.budget and best[i] + swap + dur < best[j + 1] - 1e-9:
@@ -284,14 +336,14 @@ class SortieBuilder:
     ) -> Sortie:
         """Вылет из готовых кусков: взлёт, подход, галсы с разворотами, возврат, посадка."""
         s = Sortie(index=index, base=base, base_id=base_id)
-        s.legs.append(Leg("takeoff", [base, base], self.alt, self.takeoff_s(), 0.0, self.drone.climb_rate_ms))
+        s.legs.append(self.takeoff_leg(base))
         for dp, app, t in zip(passes, [first, *turns], pass_t):
             app_kind, app_pts, app_t, app_len = app
             s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len, self.leg_speed(app_kind)))
             s.legs.append(Leg(dp.kind, [dp.a, dp.b], self.alt, t, dp.length, self.speed))
         back_pts, back_t = back
         s.legs.append(Leg("return", back_pts, self.alt, back_t, _plen(back_pts), self.transit_speed))
-        s.legs.append(Leg("landing", [base, base], self.alt, self.landing_s(), 0.0, self.descent_ms()))
+        s.legs.append(self.landing_leg(base))
         return s
 
     def _build_greedy(
@@ -304,8 +356,8 @@ class SortieBuilder:
         while queue:
             s = Sortie(index=len(sorties), base=base, base_id=base_id)
             t = self.takeoff_s()
-            s.legs.append(Leg("takeoff", [base, base], self.alt, t, 0.0, self.drone.climb_rate_ms))
-            pos, heading = base, None
+            s.legs.append(self.takeoff_leg(base))
+            pos, heading = self.launch_point(base), None
             added = 0
             while queue:
                 dp = queue[0]
@@ -335,10 +387,10 @@ class SortieBuilder:
                 raise ValueError(
                     f"{self.drone.name}: не хватает заряда даже на участок галса — область слишком далеко от базы"
                 )
-            back = self.path(pos, base)
+            back = self.path(pos, self.landing_entry(base))
             back_t = self.path_time(back, self.transit_speed)
             s.legs.append(Leg("return", back, self.alt, back_t, _plen(back), self.transit_speed))
-            s.legs.append(Leg("landing", [base, base], self.alt, self.landing_s(), 0.0, self.descent_ms()))
+            s.legs.append(self.landing_leg(base))
             sorties.append(s)
         return sorties
 
