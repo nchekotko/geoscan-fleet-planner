@@ -56,7 +56,12 @@ def _alt_bounds(drone: DroneModel, req: SurveyRequirements) -> tuple[float, floa
     return lo, hi
 
 
-def camera_params(drone: DroneModel, cam: Payload, req: SurveyRequirements) -> SurveyParams:
+def _cruise(drone: DroneModel, min_speed: float) -> float:
+    """Скорость съёмки: крейсерская, но не ниже min_speed (ветер + запас), в пределах макс. скорости."""
+    return min(max(drone.cruise_speed_ms, min_speed), drone.airspeed_max_ms)
+
+
+def camera_params(drone: DroneModel, cam: Payload, req: SurveyRequirements, min_speed: float = 0.0) -> SurveyParams:
     notes: list[str] = []
     lo, hi = _alt_bounds(drone, req)
     k = cam.sensor_w_mm / (cam.focal_mm * cam.image_w_px)  # GSD[м] = k·H
@@ -74,7 +79,9 @@ def camera_params(drone: DroneModel, cam: Payload, req: SurveyRequirements) -> S
     along = cam.image_h_px * gsd
     spacing = swath * (1 - req.side_overlap)
     base = along * (1 - req.front_overlap)
-    speed = drone.cruise_speed_ms
+    speed = _cruise(drone, min_speed)
+    if speed > drone.cruise_speed_ms:
+        notes.append(f"скорость поднята до {speed:.1f} м/с из-за ветра")
     interval = base / speed
     min_int = cam.min_trigger_interval_s or 0.0
     if interval < min_int:
@@ -99,7 +106,7 @@ def camera_params(drone: DroneModel, cam: Payload, req: SurveyRequirements) -> S
     )
 
 
-def lidar_params(drone: DroneModel, lidar: Payload, req: SurveyRequirements) -> SurveyParams:
+def lidar_params(drone: DroneModel, lidar: Payload, req: SurveyRequirements, min_speed: float = 0.0) -> SurveyParams:
     notes: list[str] = []
     lo, hi = _alt_bounds(drone, req)
     hi = min(hi, lidar.max_range_m or hi)
@@ -109,13 +116,15 @@ def lidar_params(drone: DroneModel, lidar: Payload, req: SurveyRequirements) -> 
     spacing = swath * (1 - req.side_overlap)
     # Скорость, при которой обеспечивается плотность в одной полосе.
     v_max = lidar.pulse_rate_hz / (req.lidar_density_pts_m2 * swath)
-    speed = min(drone.cruise_speed_ms, v_max)
+    speed = min(_cruise(drone, min_speed), v_max)
     if speed < 2.0:
         raise SurveyInfeasible(
             f"{lidar.name}: плотность {req.lidar_density_pts_m2} т/м² недостижима на высоте {h:.0f} м"
         )
     if speed < drone.cruise_speed_ms:
         notes.append(f"скорость снижена до {speed:.1f} м/с ради плотности точек")
+    elif speed > drone.cruise_speed_ms:
+        notes.append(f"скорость поднята до {speed:.1f} м/с из-за ветра")
     density = lidar.pulse_rate_hz / (speed * swath)
     return SurveyParams(
         altitude_agl_m=h,
@@ -127,12 +136,12 @@ def lidar_params(drone: DroneModel, lidar: Payload, req: SurveyRequirements) -> 
     )
 
 
-def geophysics_params(drone: DroneModel, sensor: Payload, req: SurveyRequirements) -> SurveyParams:
+def geophysics_params(drone: DroneModel, sensor: Payload, req: SurveyRequirements, min_speed: float = 0.0) -> SurveyParams:
     lo, hi = _alt_bounds(drone, req)
     h = min(max(req.altitude_m or sensor.recommended_alt_m or 30.0, lo), hi)
     spacing = req.line_spacing_m or sensor.recommended_line_spacing_m or 50.0
     # Для магнитной съёмки скорость ограничиваем, чтобы датчик на тросе не раскачивался.
-    speed = min(drone.cruise_speed_ms, 8.0)
+    speed = max(min(drone.cruise_speed_ms, 8.0), min(min_speed, drone.airspeed_max_ms))
     tie = spacing * (sensor.tie_line_factor or 10)
     return SurveyParams(
         altitude_agl_m=h,
@@ -144,9 +153,12 @@ def geophysics_params(drone: DroneModel, sensor: Payload, req: SurveyRequirement
     )
 
 
-def survey_params(drone: DroneModel, payload: Payload, req: SurveyRequirements) -> SurveyParams:
+def survey_params(
+    drone: DroneModel, payload: Payload, req: SurveyRequirements, min_speed: float = 0.0
+) -> SurveyParams:
+    """min_speed — нижняя граница скорости съёмки (для удержания линии пути против ветра)."""
     if payload.kind == "camera":
-        return camera_params(drone, payload, req)
+        return camera_params(drone, payload, req, min_speed)
     if payload.kind == "lidar":
-        return lidar_params(drone, payload, req)
-    return geophysics_params(drone, payload, req)
+        return lidar_params(drone, payload, req, min_speed)
+    return geophysics_params(drone, payload, req, min_speed)

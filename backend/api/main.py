@@ -73,9 +73,9 @@ def export_drone(plan_id: str, drone_id: str, fmt: str) -> Response:
         raise HTTPException(404, "борт не найден в плане")
     headers = {"Content-Disposition": f'attachment; filename="{drone_id}.{fmt}"'}
     if fmt == "geojson":
-        return JSONResponse(drone_geojson(d), media_type="application/geo+json", headers=headers)
+        return JSONResponse(drone_geojson(d, p), media_type="application/geo+json", headers=headers)
     if fmt == "kml":
-        return Response(drone_kml(d), media_type="application/vnd.google-earth.kml+xml", headers=headers)
+        return Response(drone_kml(d, p), media_type="application/vnd.google-earth.kml+xml", headers=headers)
     raise HTTPException(400, "формат: geojson или kml")
 
 

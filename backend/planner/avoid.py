@@ -9,6 +9,8 @@ import math
 from functools import lru_cache
 
 import networkx as nx
+import numpy as np
+import shapely
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
@@ -27,7 +29,13 @@ class Router:
         self.blocked = unary_union(obst) if obst else Polygon()
         self.allowed = allowed.buffer(1.0) if allowed is not None else None
         # для проверок пересечения — чуть ужатые препятствия, чтобы касание по ребру не считалось
-        self._blocked_core = prep(self.blocked.buffer(-0.5)) if not self.blocked.is_empty else None
+        core = self.blocked.buffer(-0.5)
+        self._core = None if core.is_empty else core
+        if self._core is not None:
+            shapely.prepare(self._core)
+        if self.allowed is not None:
+            shapely.prepare(self.allowed)
+        self._blocked_core = prep(core) if self._core is not None else None
         self._allowed_p = prep(self.allowed) if self.allowed is not None else None
         nodes: list[Pt] = []
         for g in getattr(self.blocked, "geoms", [self.blocked]):
@@ -43,10 +51,12 @@ class Router:
         self.graph = nx.Graph()
         self.graph.add_nodes_from(range(len(self.nodes)))
         for i, a in enumerate(self.nodes):
-            for j in range(i + 1, len(self.nodes)):
-                b = self.nodes[j]
-                if self.visible(a, b):
-                    self.graph.add_edge(i, j, weight=math.dist(a, b))
+            rest = self.nodes[i + 1:]
+            if not rest:
+                continue
+            for k in np.flatnonzero(self.visible_many(a, rest)):
+                j = i + 1 + int(k)
+                self.graph.add_edge(i, j, weight=math.dist(a, self.nodes[j]))
 
     def _point_free(self, p: Pt) -> bool:
         pt = Point(p)
@@ -61,6 +71,21 @@ class Router:
         if self._blocked_core is not None and self._blocked_core.intersects(line):
             return False
         return self._allowed_p is None or self._allowed_p.contains(line)
+
+    def visible_many(self, a: Pt, pts: list[Pt]) -> np.ndarray:
+        """Векторная проверка видимости из a во все точки pts."""
+        if not pts:
+            return np.zeros(0, dtype=bool)
+        coords = np.empty((len(pts), 2, 2))
+        coords[:, 0, :] = a
+        coords[:, 1, :] = pts
+        lines = shapely.linestrings(coords)
+        ok = np.ones(len(pts), dtype=bool)
+        if self._core is not None:
+            ok &= ~shapely.intersects(self._core, lines)
+        if self.allowed is not None:
+            ok &= shapely.contains(self.allowed, lines)
+        return ok
 
     def polyline_free(self, pts: list[Pt]) -> bool:
         return all(self.visible(a, b) for a, b in zip(pts, pts[1:]))
@@ -77,11 +102,10 @@ class Router:
         src, dst = "p", "q"
         g.add_node(src)
         g.add_node(dst)
-        for i, n in enumerate(self.nodes):
-            if self.visible(p, n):
-                g.add_edge(src, i, weight=math.dist(p, n))
-            if self.visible(n, q):
-                g.add_edge(i, dst, weight=math.dist(n, q))
+        for i in np.flatnonzero(self.visible_many(p, self.nodes)):
+            g.add_edge(src, int(i), weight=math.dist(p, self.nodes[i]))
+        for i in np.flatnonzero(self.visible_many(q, self.nodes)):
+            g.add_edge(int(i), dst, weight=math.dist(self.nodes[i], q))
         try:
             path = nx.shortest_path(g, src, dst, weight="weight")
         except nx.NetworkXNoPath:

@@ -40,6 +40,8 @@ class Sortie:
     base_id: str
     legs: list[Leg] = field(default_factory=list)
     start_s: float = 0.0
+    max_divert_s: float = 0.0     # худшее время ухода на ближайшую площадку
+    divert_site: str = ""
 
     @property
     def duration_s(self) -> float:
@@ -47,13 +49,14 @@ class Sortie:
 
     @property
     def survey_length_m(self) -> float:
-        return sum(l.distance_m for l in self.legs if l.kind == "survey")
+        return sum(l.distance_m for l in self.legs if l.kind in ("survey", "tie"))
 
 
 @dataclass
 class DirectedPass:
     a: tuple[float, float]
     b: tuple[float, float]
+    kind: str = "survey"  # survey — основной галс, tie — секущий маршрут
 
     @property
     def heading(self) -> float:
@@ -64,7 +67,7 @@ class DirectedPass:
         return math.dist(self.a, self.b)
 
 
-def _snake(cell: list[Pass], start: tuple[float, float]) -> list[DirectedPass]:
+def _snake(cell: list[Pass], start: tuple[float, float], kind: str = "survey") -> list[DirectedPass]:
     """Змейка по ячейке. Из 4 вариантов входа (первая/последняя линия, левый/правый конец)
     берём ближайший к текущей точке."""
     best: list[DirectedPass] = []
@@ -74,7 +77,7 @@ def _snake(cell: list[Pass], start: tuple[float, float]) -> list[DirectedPass]:
             seq: list[DirectedPass] = []
             fwd = first_fwd
             for p in (reversed(cell) if rev else cell):
-                seq.append(DirectedPass(p.a, p.b) if fwd else DirectedPass(p.b, p.a))
+                seq.append(DirectedPass(p.a, p.b, kind) if fwd else DirectedPass(p.b, p.a, kind))
                 fwd = not fwd
             d = math.dist(start, seq[0].a)
             if d < best_d:
@@ -82,7 +85,7 @@ def _snake(cell: list[Pass], start: tuple[float, float]) -> list[DirectedPass]:
     return best
 
 
-def order_passes(passes: list[Pass], start: tuple[float, float]) -> list[DirectedPass]:
+def order_passes(passes: list[Pass], start: tuple[float, float], kind: str = "survey") -> list[DirectedPass]:
     """Порядок обхода: ячейки boustrophedon, внутри ячейки — змейка, следующая ячейка —
     ближайшая к концу предыдущей (жадно)."""
     if not passes:
@@ -94,7 +97,7 @@ def order_passes(passes: list[Pass], start: tuple[float, float]) -> list[Directe
     while left:
         best_i, best_seq, best_d = -1, [], math.inf
         for i in left:
-            seq = _snake(cells[i], pos)
+            seq = _snake(cells[i], pos, kind)
             d = math.dist(pos, seq[0].a)
             if d < best_d:
                 best_i, best_seq, best_d = i, seq, d
@@ -161,6 +164,29 @@ class SortieBuilder:
         t += math.pi * self.drone.turn_radius_m / self.speed if self.drone.type == "fixed_wing" else self.speed / MULTIROTOR_ACCEL
         return "transit", pts, t, _plen(pts)
 
+    def divert_check(self, s: "Sortie", sites: dict[str, tuple[float, float]], step: float = 400.0) -> None:
+        """Для точек вылета (с шагом step вдоль участков) — время до ближайшей площадки
+        (база или резервная) с обходом зон, плюс посадка. Худшее значение — в s.max_divert_s."""
+        worst, worst_site = 0.0, ""
+        for leg in s.legs:
+            if leg.kind in ("takeoff", "landing"):
+                continue
+            for a, b in zip(leg.points, leg.points[1:]):
+                n = max(1, math.ceil(math.dist(a, b) / step))
+                for k in range(n + 1):
+                    p = (a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n)
+                    best, best_id = math.inf, ""
+                    # маршрут строим только к двум ближайшим по прямой площадкам
+                    near = sorted(sites.items(), key=lambda kv: math.dist(p, kv[1]))[:2]
+                    for sid, q in near:
+                        t = self.path_time(self.path(p, q), self.transit_speed)
+                        if t < best:
+                            best, best_id = t, sid
+                    if best > worst:
+                        worst, worst_site = best, best_id
+        s.max_divert_s = worst + self.landing_s()
+        s.divert_site = worst_site
+
     def takeoff_s(self) -> float:
         climb = self.alt / self.drone.climb_rate_ms
         return climb + (FIXED_WING_TAKEOFF_S if self.drone.type == "fixed_wing" else 0.0)
@@ -191,7 +217,7 @@ class SortieBuilder:
                 pass_t = self.fly_time(dp.a, dp.b, self.speed)
                 if t + app_t + pass_t + self.return_s(dp.b, base) <= self.budget:
                     s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len))
-                    s.legs.append(Leg("survey", [dp.a, dp.b], self.alt, pass_t, dp.length))
+                    s.legs.append(Leg(dp.kind, [dp.a, dp.b], self.alt, pass_t, dp.length))
                     t += app_t + pass_t
                     pos, heading = dp.b, dp.heading
                     queue.pop(0)
@@ -203,10 +229,10 @@ class SortieBuilder:
                     cut = (dp.a[0] + frac * (dp.b[0] - dp.a[0]), dp.a[1] + frac * (dp.b[1] - dp.a[1]))
                     part_t = self.fly_time(dp.a, cut, self.speed)
                     s.legs.append(Leg(app_kind, app_pts, self.alt, app_t, app_len))
-                    s.legs.append(Leg("survey", [dp.a, cut], self.alt, part_t, math.dist(dp.a, cut)))
+                    s.legs.append(Leg(dp.kind, [dp.a, cut], self.alt, part_t, math.dist(dp.a, cut)))
                     t += app_t + part_t
                     pos, heading = cut, dp.heading
-                    queue[0] = DirectedPass(cut, dp.b)
+                    queue[0] = DirectedPass(cut, dp.b, dp.kind)
                     added += 1
                 break
             if added == 0:

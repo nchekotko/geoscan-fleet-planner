@@ -53,6 +53,8 @@ class SortieOut(BaseModel):
     start_s: float
     duration_s: float
     survey_length_m: float
+    max_divert_s: float = 0.0
+    divert_site: str = ""
     legs: list[LegOut]
 
 
@@ -92,3 +94,5 @@ class PlanResponse(BaseModel):
     warnings: list[str]
     working_area: dict[str, Any]
     time_weight: float
+    reserve_sites: list[Site] = Field(default_factory=list)
+    bases: list[Site] = Field(default_factory=list)

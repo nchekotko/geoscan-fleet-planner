@@ -217,3 +217,54 @@ def test_fixed_wing_turns_never_replaced_by_straight_hops():
     assert d.model == "geoscan_201"
     hops = [l for s in d.sorties for l in s.legs if l.kind == "transit" and l.distance_m < 200]
     assert not hops
+
+
+# --- дополнительные сценарии ------------------------------------------------------
+def scenario(name: str, **over) -> PlanRequest:
+    data = json.loads((SCENARIO.parent / f"{name}.json").read_text(encoding="utf-8"))
+    data.update(over)
+    return PlanRequest(**data)
+
+
+def _assert_budget(req, res):
+    for d in res.drones:
+        budget = usable_flight_time_s(FLEET.drones[d.model], req.wind, req.reserve)
+        for s in d.sorties:
+            assert s.duration_s <= budget + 1, (d.drone_id, s.index)
+
+
+def test_geophysics_has_tie_lines():
+    req = scenario("geophysics_401")
+    res = plan(req)
+    kinds = {l.kind for d in res.drones for s in d.sorties for l in s.legs}
+    assert "tie" in kinds and "survey" in kinds
+    assert all(d.params.altitude_agl_m == 30 for d in res.drones)
+    _assert_budget(req, res)
+
+
+def test_large_area_uses_reach_aware_partition():
+    req = scenario("large_mixed_fleet")
+    res = plan(req)
+    assert any("с учётом дальности" in w for w in res.warnings)
+    assert res.summary.coverage_pct > 99
+    _assert_budget(req, res)
+    # мультироторы работают у своих баз, основной объём — у самолётов
+    by_model = {}
+    for d in res.drones:
+        by_model[d.model] = by_model.get(d.model, 0) + d.area_km2
+    assert by_model["geoscan_201"] > 5 * by_model["geoscan_gemini"]
+
+
+def test_strong_wind_raises_speed_and_excludes_weak():
+    res = plan(scenario("strong_wind"))
+    ids = {d.drone_id for d in res.drones}
+    assert ids == {"201-1", "401-1"}
+    d401 = next(d for d in res.drones if d.drone_id == "401-1")
+    assert d401.params.speed_ms > 11
+
+
+def test_divert_to_nearest_site_computed():
+    res = plan(load_req())
+    for d in res.drones:
+        for s in d.sorties:
+            assert s.max_divert_s > 0 and s.divert_site

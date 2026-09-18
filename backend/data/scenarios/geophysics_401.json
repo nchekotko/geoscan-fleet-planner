@@ -1,0 +1,95 @@
+{
+ "survey_area": {
+  "type": "Polygon",
+  "coordinates": [
+   [
+    [
+     37.93981,
+     55.443759
+    ],
+    [
+     37.96429,
+     55.447505
+    ],
+    [
+     37.96019,
+     55.456241
+    ],
+    [
+     37.93571,
+     55.452495
+    ],
+    [
+     37.93981,
+     55.443759
+    ]
+   ]
+  ]
+ },
+ "no_fly_zones": [
+  {
+   "type": "Polygon",
+   "coordinates": [
+    [
+     [
+      37.95302,
+      55.451096
+     ],
+     [
+      37.95698,
+      55.451096
+     ],
+     [
+      37.95698,
+      55.452904
+     ],
+     [
+      37.95302,
+      55.452904
+     ],
+     [
+      37.95302,
+      55.451096
+     ]
+    ]
+   ]
+  }
+ ],
+ "bases": [
+  {
+   "id": "A",
+   "name": "Лагерь",
+   "lon": 37.935,
+   "lat": 55.443
+  }
+ ],
+ "reserve_sites": [
+  {
+   "id": "R1",
+   "lon": 37.965,
+   "lat": 55.457
+  }
+ ],
+ "drones": [
+  {
+   "id": "401-mag-1",
+   "model": "geoscan_401",
+   "payload": "geoshark"
+  },
+  {
+   "id": "401-mag-2",
+   "model": "geoscan_401",
+   "payload": "geoshark"
+  }
+ ],
+ "survey_type": "geophysics",
+ "requirements": {
+  "line_spacing_m": 50,
+  "altitude_m": 30
+ },
+ "wind": {
+  "speed_ms": 4,
+  "from_deg": 200
+ },
+ "time_weight": 1.0
+}

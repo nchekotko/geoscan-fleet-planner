@@ -1,0 +1,65 @@
+{
+ "survey_area": {
+  "type": "Polygon",
+  "coordinates": [
+   [
+    [
+     37.60012,
+     55.600956
+    ],
+    [
+     37.63988,
+     55.600956
+    ],
+    [
+     37.63988,
+     55.619044
+    ],
+    [
+     37.60012,
+     55.619044
+    ],
+    [
+     37.60012,
+     55.600956
+    ]
+   ]
+  ]
+ },
+ "no_fly_zones": [],
+ "bases": [
+  {
+   "id": "A",
+   "lon": 37.6,
+   "lat": 55.595
+  }
+ ],
+ "reserve_sites": [],
+ "drones": [
+  {
+   "id": "201-1",
+   "model": "geoscan_201"
+  },
+  {
+   "id": "gemini-1",
+   "model": "geoscan_gemini"
+  },
+  {
+   "id": "801-1",
+   "model": "geoscan_801"
+  },
+  {
+   "id": "401-1",
+   "model": "geoscan_401"
+  }
+ ],
+ "survey_type": "rgb",
+ "requirements": {
+  "gsd_cm": 4
+ },
+ "wind": {
+  "speed_ms": 11,
+  "from_deg": 0
+ },
+ "time_weight": 1.0
+}

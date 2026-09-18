@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
+from shapely.errors import GEOSException
+from shapely.validation import make_valid
 
 from .avoid import Router
 from .coverage import best_direction, sweep_passes
@@ -23,6 +25,8 @@ from .fleet import DroneModel, Payload, load_fleet
 from .geo import LocalFrame
 from .mission import Sortie, SortieBuilder, order_passes, schedule
 from .turns import turn_overshoot
+from .grid_partition import grid_partition
+from .mission import FIXED_WING_LANDING_S, FIXED_WING_TAKEOFF_S, MULTIROTOR_DESCENT_MS
 from .partition import split_by_fractions, strip_axis_position
 from .schemas import (
     DronePlanOut,
@@ -49,6 +53,7 @@ class Candidate:
     budget_s: float
     base_id: str | None
     productivity: float  # м²/с с учётом смены АКБ
+    reach_m: float = math.inf  # радиус действия от базы: заряд туда-обратно и радиоканал
 
 
 @dataclass
@@ -69,6 +74,7 @@ class Evaluation:
     fractions: list[float]
     results: list[DroneResult]
     leftover_m2: float = 0.0  # не снято: самолёту не хватает места для разворота, мультиротора нет
+    unreachable_m2: float = 0.0  # не снято: вне радиуса действия всех бортов
 
     @property
     def makespan(self) -> float:
@@ -80,6 +86,9 @@ class Evaluation:
 
 
 def _polys(g: BaseGeometry) -> BaseGeometry:
+    """Только полигональная часть геометрии, приведённая к валидному виду."""
+    if not g.is_valid:
+        g = make_valid(g)
     if isinstance(g, (Polygon, MultiPolygon)):
         return g
     ps = [x for x in getattr(g, "geoms", []) if isinstance(x, Polygon)]
@@ -112,8 +121,10 @@ class Planner:
         self.area = _polys(area.buffer(0))
         if self.area.is_empty or self.area.area < 100:
             raise PlanningError("рабочая область пуста после вычета запретных зон")
+        self.mode = "strips"
         self.router = Router(self.nfz, req.nfz_buffer_m, self.allowed)
         self.bases = {b.id: f.lonlat_to_xy(b.lon, b.lat) for b in req.bases}
+        self.reserve_sites = {r.id: f.lonlat_to_xy(r.lon, r.lat) for r in req.reserve_sites}
         if not self.bases:
             raise PlanningError("не задано ни одного взлётно-посадочного пункта")
         self.candidates = self._candidates()
@@ -151,7 +162,8 @@ class Planner:
                 self.excluded.append(ExcludedDrone(drone_id=inst.id, reason=wind_problem))
                 continue
             try:
-                params = survey_params(drone, payload, req.requirements)
+                # против ветра нужна путевая скорость ≥ ~2 м/с
+                params = survey_params(drone, payload, req.requirements, min_speed=req.wind.speed_ms + 2.0)
             except SurveyInfeasible as e:
                 self.excluded.append(ExcludedDrone(drone_id=inst.id, reason=str(e)))
                 continue
@@ -167,7 +179,13 @@ class Planner:
             overhead = params.altitude_agl_m / drone.climb_rate_ms * 2 + (180 if drone.type == "fixed_wing" else 0)
             availability = max(budget - overhead, 1.0) / (budget + drone.swap_time_min * 60)
             productivity = params.speed_ms * params.line_spacing_m * availability
-            out.append(Candidate(inst.id, drone, payload, params, budget, inst.base_id, productivity))
+            fw = drone.type == "fixed_wing"
+            t_ops = params.altitude_agl_m / drone.climb_rate_ms + (
+                FIXED_WING_TAKEOFF_S + FIXED_WING_LANDING_S if fw else params.altitude_agl_m / MULTIROTOR_DESCENT_MS
+            )
+            v_back = max(max(params.speed_ms, drone.cruise_speed_ms) - req.wind.speed_ms, 0.5)
+            reach = min(0.5 * max(budget - t_ops, 0.0) * v_back * 0.85, drone.radio_range_km * 1000)
+            out.append(Candidate(inst.id, drone, payload, params, budget, inst.base_id, productivity, reach))
         return out
 
     # ------------------------------------------------------------- оценка
@@ -196,9 +214,25 @@ class Planner:
             for piece in getattr(gap, "geoms", [gap]):
                 if piece.area < 1.0:
                     continue
-                j = min(multi, key=lambda k: regions[k].distance(piece) if not regions[k].is_empty else math.inf)
+                # только мультироторы, которые долетают до всего куска
+                able = [
+                    k for k in multi
+                    if self._far_point(piece, cands[k]) <= cands[k].reach_m
+                ]
+                if not able:
+                    leftover += piece.area
+                    continue
+                j = min(able, key=lambda k: regions[k].distance(piece) if not regions[k].is_empty
+                        else self._far_point(piece, cands[k]))
                 regions[j] = _polys(unary_union([regions[j], piece]))
         return regions, leftover
+
+    def _far_point(self, geom: BaseGeometry, cand: Candidate) -> float:
+        b = self.bases[cand.base_id or self._default_base(self.area)]
+        return max(
+            (math.dist(b, c) for g in getattr(geom, "geoms", [geom]) for c in g.exterior.coords),
+            default=0.0,
+        )
 
     def _turn_room(self, region: BaseGeometry, cand: Candidate) -> BaseGeometry:
         """Самолёту нужен запас для разворота за концом галса: отступаем от NFZ и от границы
@@ -215,7 +249,16 @@ class Planner:
 
     def evaluate(self, cands: list[Candidate], fractions: list[float], angle: float) -> Evaluation:
         active = [(c, f) for c, f in zip(cands, fractions) if f > 1e-6]
-        regions = split_by_fractions(self.area, angle, [f for _, f in active])
+        unreachable = 0.0
+        if self.mode == "grid":
+            regions, rest = grid_partition(
+                self.area, angle, [f for _, f in active],
+                [self.bases[c.base_id or self._default_base(self.area)] for c, _ in active],
+                [c.reach_m for c, _ in active],
+            )
+            unreachable = rest.area
+        else:
+            regions = split_by_fractions(self.area, angle, [f for _, f in active])
         regions, leftover = self._reassign_turn_gaps([c for c, _ in active], regions)
         results: list[DroneResult] = []
         for (cand, _), region in zip(active, regions):
@@ -224,11 +267,15 @@ class Planner:
             p = cand.params
             passes = sweep_passes(region, angle, p.line_spacing_m) if not region.is_empty else []
             route = order_passes(passes, base)
+            if p.tie_line_spacing_m and not region.is_empty:
+                # секущие маршруты поперёк основных галсов (геофизика)
+                ties = sweep_passes(region, angle + math.pi / 2, p.tie_line_spacing_m)
+                route += order_passes(ties, route[-1].b if route else base, kind="tie")
             builder = SortieBuilder(cand.drone, p.speed_ms, p.altitude_agl_m, self.req.wind, cand.budget_s, self.router)
             sorties = builder.build(route, base, base_id)
             finish = schedule(sorties, cand.drone.swap_time_min * 60)
             results.append(DroneResult(cand, region, base_id, sorties, finish))
-        return Evaluation(fractions=list(fractions), results=results, leftover_m2=leftover)
+        return Evaluation(fractions=list(fractions), results=results, leftover_m2=leftover, unreachable_m2=unreachable)
 
     # ---------------------------------------------------------- оптимизация
     def solve(self) -> tuple[Evaluation, float]:
@@ -244,7 +291,16 @@ class Planner:
 
         cands.sort(key=axis_key)
         fr = [c.productivity for c in cands]
-        best = self._balance(cands, fr, angle)
+        # Полосы дают лучшую геометрию. Если какой-то борт не достаёт до своей полосы,
+        # переходим к разбиению сеткой с учётом радиуса действия.
+        try:
+            best = self._balance(cands, fr, angle)
+        except ValueError:
+            self.mode = "grid"
+            self.warnings.append(
+                "область больше радиуса действия части бортов — использовано разбиение с учётом дальности"
+            )
+            best = self._balance(cands, fr, angle)
         w = self.req.time_weight
         if w < 1.0 and len(cands) > 1:
             best = self._local_search(cands, best, angle, w)
@@ -254,7 +310,9 @@ class Planner:
         """Выравнивание времени окончания работ: доли корректируются по фактическому времени."""
         best = self.evaluate(cands, fr, angle)
         cur = best
-        for _ in range(iters):
+        for it in range(iters):
+            if self.mode == "grid" and it >= 6:
+                break  # сеточное разбиение дороже, хватает нескольких итераций
             times = [r.finish_s for r in cur.results]
             mean = sum(times) / len(times)
             if max(times) - min(times) < 0.02 * mean:
@@ -262,7 +320,10 @@ class Planner:
             fr = [f * (mean / max(t, 1.0)) ** 0.8 for f, t in zip(cur.fractions, times)]
             s = sum(fr)
             fr = [f / s for f in fr]
-            cur = self.evaluate(cands, fr, angle)
+            try:
+                cur = self.evaluate(cands, fr, angle)
+            except ValueError:
+                break
             if cur.makespan < best.makespan:
                 best = cur
         return best
@@ -277,7 +338,8 @@ class Planner:
         n = len(cands)
         step = 0.5
         evals = 0
-        while step > 0.05 and evals < 200:
+        max_evals = 40 if self.mode == "grid" else 200
+        while step > 0.05 and evals < max_evals:
             improved = False
             for i in range(n):
                 for j in range(n):
@@ -292,7 +354,7 @@ class Planner:
                         fr[i] = 0.0
                     try:
                         e = self.evaluate(cands, fr, angle)
-                    except ValueError:
+                    except (ValueError, GEOSException):
                         continue
                     evals += 1
                     j_val = score(e)
@@ -305,6 +367,19 @@ class Planner:
     # ------------------------------------------------------------ вывод
     def _check(self, res: DroneResult) -> None:
         d = res.cand.drone
+        p = res.cand.params
+        sites = {**self.bases, **self.reserve_sites}
+        builder = SortieBuilder(d, p.speed_ms, p.altitude_agl_m, self.req.wind, res.cand.budget_s, self.router)
+        # резерв заряда в секундах: то, что осталось сверх бюджета вылета
+        reserve_s = usable_flight_time_s(d, self.req.wind, 0.0) - res.cand.budget_s
+        for s in res.sorties:
+            builder.divert_check(s, sites)
+            if s.max_divert_s > reserve_s:
+                self.warnings.append(
+                    f"{res.cand.instance_id}: в вылете {s.index + 1} до ближайшей площадки ({s.divert_site}) "
+                    f"до {s.max_divert_s / 60:.1f} мин — больше резерва заряда {reserve_s / 60:.1f} мин; "
+                    "добавьте резервную площадку ближе к области"
+                )
         radio = d.radio_range_km * 1000
         base = self.bases[res.base_id]
         for s in res.sorties:
@@ -332,7 +407,7 @@ class Planner:
             half = r.cand.params.swath_m / 2
             for s in r.sorties:
                 for leg in s.legs:
-                    if leg.kind == "survey" and leg.distance_m > 0:
+                    if leg.kind in ("survey", "tie") and leg.distance_m > 0:
                         strips.append(LineString(leg.points).buffer(half, cap_style="flat"))
         if not strips:
             return 0.0
@@ -358,6 +433,7 @@ class Planner:
                 ]
                 sorties_out.append(
                     SortieOut(index=s.index, base_id=s.base_id, start_s=round(s.start_s, 1),
+                          max_divert_s=round(s.max_divert_s, 1), divert_site=s.divert_site,
                               duration_s=round(s.duration_s, 1), survey_length_m=round(s.survey_length_m, 1), legs=legs)
                 )
             drones_out.append(
@@ -383,6 +459,11 @@ class Planner:
                 f"{ev.leftover_m2 / 1e6:.3f} км² у запретных зон не снято: самолёту не хватает места для "
                 "разворота. Добавьте в парк мультиротор или увеличьте запас вокруг зон"
             )
+        if ev.unreachable_m2 > 100:
+            self.warnings.append(
+                f"{ev.unreachable_m2 / 1e6:.3f} км² вне радиуса действия всех бортов (заряд или радиоканал) — "
+                "добавьте ВПП ближе к области или борт с большей дальностью"
+            )
         covered = self._coverage(ev.results)
         area = self.area.area
         summary = Summary(
@@ -401,6 +482,8 @@ class Planner:
             warnings=self.warnings,
             working_area=mapping(f.to_wgs(self.area)),
             time_weight=self.req.time_weight,
+            reserve_sites=self.req.reserve_sites,
+            bases=self.req.bases,
         )
 
 
