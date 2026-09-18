@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -18,9 +23,65 @@ from planner.planner import PlanningError, plan
 from planner.schemas import PlanRequest, PlanResponse
 
 SCENARIOS = Path(__file__).resolve().parent.parent / "data" / "scenarios"
+log = logging.getLogger("geoscan.api")
 
 app = FastAPI(title="Geoscan Fleet Planner", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def _unexpected_errors(request: Request, call_next):
+    """Непредвиденная ошибка → JSON 500 с коротким сообщением для интерфейса, трассировка — в лог."""
+    try:
+        return await call_next(request)
+    except Exception:  # noqa: BLE001
+        log.exception("ошибка при обработке %s %s", request.method, request.url.path)
+        return JSONResponse(
+            {"detail": "внутренняя ошибка планировщика: план не построен, проверьте входные данные"},
+            status_code=500,
+        )
+
+
+# Частые ошибки pydantic по-русски; остальные — исходным текстом.
+_VALIDATION_RU = {
+    "missing": "обязательное поле",
+    "less_than_equal": "должно быть не больше {le}",
+    "less_than": "должно быть меньше {lt}",
+    "greater_than_equal": "должно быть не меньше {ge}",
+    "greater_than": "должно быть больше {gt}",
+    "finite_number": "должно быть конечным числом",
+    "float_parsing": "нужно число",
+    "float_type": "нужно число",
+    "too_short": "нужно хотя бы {min_length} знач.",
+    "string_too_short": "не может быть пустым",
+    "literal_error": "допустимые значения: {expected}",
+}
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 с читаемой строкой в detail (её показывает интерфейс) и полным списком в errors."""
+    parts = []
+    for e in exc.errors():
+        loc = ".".join(str(x) for x in e.get("loc", ()) if x != "body")
+        tpl = _VALIDATION_RU.get(e.get("type", ""))
+        try:
+            msg = tpl.format(**e.get("ctx", {})) if tpl else str(e.get("msg", "")).removeprefix("Value error, ")
+        except (KeyError, IndexError):
+            msg = str(e.get("msg", ""))
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return JSONResponse(
+        {"detail": "некорректные входные данные — " + "; ".join(parts),
+         # без input: в нём может быть NaN, который не сериализуется в JSON
+         "errors": jsonable_encoder([{k: e[k] for k in ("type", "loc", "msg") if k in e} for e in exc.errors()])},
+        status_code=422,
+    )
+
+
+def _attachment(filename: str) -> dict[str, str]:
+    """Content-Disposition по RFC 6266: ASCII-запасное имя и filename* в UTF-8."""
+    fallback = re.sub(r'[^A-Za-z0-9._-]', "_", filename)
+    return {"Content-Disposition": f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"}
 
 # Рассчитанные планы держим в памяти процесса: для демо этого достаточно.
 _plans: dict[str, PlanResponse] = {}
@@ -69,6 +130,8 @@ def make_pareto(req: PlanRequest) -> list[dict]:
         front = pareto_front(req)
     except PlanningError as e:
         raise HTTPException(422, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(422, f"фронт Парето не построен: {e}") from e
     if not front:
         raise HTTPException(422, "не удалось построить ни одного плана")
     out = []
@@ -91,7 +154,7 @@ def export_drone(plan_id: str, drone_id: str, fmt: str) -> Response:
     d = next((x for x in p.drones if x.drone_id == drone_id), None)
     if d is None:
         raise HTTPException(404, "борт не найден в плане")
-    headers = {"Content-Disposition": f'attachment; filename="{drone_id}.{fmt}"'}
+    headers = _attachment(f"{drone_id}.{fmt}")
     if fmt == "geojson":
         return JSONResponse(drone_geojson(d, p), media_type="application/geo+json", headers=headers)
     if fmt == "kml":
@@ -105,7 +168,7 @@ def export_all(plan_id: str) -> Response:
     return Response(
         data,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="plan_{plan_id}.zip"'},
+        headers=_attachment(f"plan_{plan_id}.zip"),
     )
 
 

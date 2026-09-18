@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import math
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Wind(BaseModel):
-    speed_ms: float = 0.0
-    from_deg: float = 0.0
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    speed_ms: float = Field(0.0, ge=0.0, le=40.0)
+    from_deg: float = Field(0.0, ge=0.0, le=360.0)
 
     def vector(self) -> tuple[float, float]:
         """Вектор движения воздуха (куда дует) в локальных x (восток), y (север)."""
