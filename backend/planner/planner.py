@@ -51,6 +51,7 @@ from .schemas import (
     TerrainInfo,
 )
 from .sensors import SurveyInfeasible, SurveyParams, survey_params
+from .wind import Wind, ground_speed
 
 # Минимальный вес времени работ в критерии «налёт» (w = 0): разрешает почти равные по налёту
 # планы в пользу более быстрого.
@@ -69,6 +70,35 @@ class PlanningError(ValueError):
     pass
 
 
+# запас радиуса действия на обходы NFZ, развороты и неточность прямой «база — точка»
+REACH_MARGIN = 0.10
+# «выгодный» радиус при делении сеткой: перелёт туда-обратно — не больше этой доли вылета
+PROFITABLE_TRANSIT_SHARE = 0.5
+
+
+def round_trip_s_per_m(v: float, wind: Wind, steps: int = 72) -> float:
+    """Время полёта туда-обратно на 1 м удаления при худшем направлении:
+    max_θ [1/gs(V, θ) + 1/gs(V, θ + π)] по треугольнику скоростей (wind.ground_speed)."""
+    def inv_gs(theta: float) -> float:
+        gs = ground_speed(v, theta, wind)
+        # как в SortieBuilder.fly_time: линию не удержать — минимально разумная скорость
+        return 1.0 / (gs if gs is not None else max(0.5, v - wind.speed_ms))
+
+    return max(inv_gs(2 * math.pi * k / steps) + inv_gs(2 * math.pi * k / steps + math.pi) for k in range(steps))
+
+
+def energy_range_m(drone: DroneModel, params: SurveyParams, budget_s: float, wind: Wind) -> float:
+    """Предельное удаление от базы, на которое борт долетает и возвращается без съёмки.
+    Скорость транзита та же, что у SortieBuilder (не ниже крейсерской); радиус — лишь
+    эвристика разбиения, точную проверку заряда делает SortieBuilder."""
+    fw = drone.type == "fixed_wing"
+    t_ops = params.altitude_agl_m / drone.climb_rate_ms + (
+        FIXED_WING_TAKEOFF_S + FIXED_WING_LANDING_S if fw else params.altitude_agl_m / MULTIROTOR_DESCENT_MS
+    )
+    v = max(params.speed_ms, drone.cruise_speed_ms)
+    return max(budget_s - t_ops, 0.0) / round_trip_s_per_m(v, wind)
+
+
 UNCOVERED_TOL_M2 = 100.0  # допуск на неснятую площадь при сравнении планов (шум геометрии)
 UNCOVERED_PENALTY = 10.0  # вес доли неснятой площади в целевой функции локального поиска
 
@@ -83,6 +113,7 @@ class Candidate:
     base_id: str | None
     productivity: float  # м²/с с учётом смены АКБ
     reach_m: float = math.inf  # радиус действия от базы: заряд туда-обратно и радиоканал
+    work_reach_m: float = math.inf  # «выгодный» радиус: перелёт не больше половины вылета
 
 
 @dataclass
@@ -227,12 +258,9 @@ class Planner:
             overhead = params.altitude_agl_m / drone.climb_rate_ms * 2 + (180 if drone.type == "fixed_wing" else 0)
             availability = max(budget - overhead, 1.0) / (budget + drone.swap_time_min * 60)
             productivity = params.speed_ms * params.line_spacing_m * availability
-            fw = drone.type == "fixed_wing"
-            t_ops = params.altitude_agl_m / drone.climb_rate_ms + (
-                FIXED_WING_TAKEOFF_S + FIXED_WING_LANDING_S if fw else params.altitude_agl_m / MULTIROTOR_DESCENT_MS
-            )
-            v_back = max(max(params.speed_ms, drone.cruise_speed_ms) - req.wind.speed_ms, 0.5)
-            reach = min(0.5 * max(budget - t_ops, 0.0) * v_back * 0.85, drone.radio_range_km * 1000)
+            # радиус действия: туда-обратно при худшем направлении ветра, с запасом, и радиоканал
+            range_m = energy_range_m(drone, params, budget, req.wind)
+            reach = min(range_m * (1 - REACH_MARGIN), drone.radio_range_km * 1000)
             # борт, который не долетает ни до одной точки области, работать не может
             gap = self.area.distance(Point(self.bases[inst.base_id or self._default_base(self.area)]))
             if gap >= reach:
@@ -242,10 +270,15 @@ class Planner:
                            f"радиус действия {reach / 1000:.1f} км",
                 ))
                 continue
-            out.append(Candidate(inst.id, drone, payload, params, budget, inst.base_id, productivity, reach))
+            out.append(Candidate(inst.id, drone, payload, params, budget, inst.base_id, productivity, reach,
+                                 min(reach, range_m * PROFITABLE_TRANSIT_SHARE)))
         return out
 
     # ------------------------------------------------------------- оценка
+    def _reaches(self, geom: BaseGeometry, cand: Candidate) -> bool:
+        """Единая проверка досягаемости участка: вся геометрия в радиусе действия борта."""
+        return self._far_point(geom, cand) <= cand.reach_m
+
     def _default_base(self, region: BaseGeometry) -> str:
         """Ближайшая к центру участка база (для пустого участка — к центру всей области)."""
         c = (region if not region.is_empty else self.area).centroid
@@ -279,10 +312,7 @@ class Planner:
                 if piece.area < 1.0:
                     continue
                 # только мультироторы, которые долетают до всего куска
-                able = [
-                    k for k in multi
-                    if self._far_point(piece, cands[k]) <= cands[k].reach_m
-                ]
+                able = [k for k in multi if self._reaches(piece, cands[k])]
                 if not able:
                     leftover += piece.area
                     continue
@@ -321,10 +351,15 @@ class Planner:
                 self.area, angle, [f for _, f in active],
                 [self.bases[c.base_id or self._default_base(self.area)] for c, _ in active],
                 [c.reach_m for c, _ in active],
+                work_reach=[c.work_reach_m for c, _ in active],
             )
             unreachable = rest.area
         else:
             regions = split_by_fractions(self.area, angle, [f for _, f in active])
+            for (c, _), r in zip(active, regions):
+                if not r.is_empty and not self._reaches(r, c):
+                    # полоса за радиусом действия — переходим к разбиению с учётом дальности
+                    raise ValueError(f"{c.instance_id}: полоса за пределами радиуса действия")
         # резерв для полос у NFZ — мультироторы с нулевой долей
         spare = [c for c, f in zip(cands, fractions) if f <= 1e-6 and c.drone.type == "multirotor"]
         workers = [c for c, _ in active] + spare
@@ -887,9 +922,12 @@ class Planner:
         for u in sorted(unused):
             self.excluded.append(ExcludedDrone(drone_id=u, reason="не задействован: так выгоднее по выбранному критерию"))
         if ev.leftover_m2 > 100:
+            has_multi = any(c.drone.type == "multirotor" for c in self.candidates)
+            advice = ("мультироторы парка не долетают до этих полос — поставьте ВПП ближе к зонам"
+                      if has_multi else "добавьте в парк мультиротор")
             self.warnings.append(
                 f"{ev.leftover_m2 / 1e6:.3f} км² у запретных зон не снято: самолёту не хватает места для "
-                "разворота. Добавьте в парк мультиротор или увеличьте запас вокруг зон"
+                f"разворота; {advice} или увеличьте запас вокруг зон"
             )
         if ev.unreachable_m2 > 100:
             self.warnings.append(

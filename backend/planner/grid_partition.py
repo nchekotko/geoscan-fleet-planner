@@ -57,8 +57,13 @@ def grid_partition(
     bases: list[tuple[float, float]],
     reach: list[float],
     cell: float | None = None,
+    work_reach: list[float] | None = None,
 ) -> tuple[list[BaseGeometry], BaseGeometry]:
-    """Возвращает участки бортов (в порядке fractions) и недостижимый остаток."""
+    """Возвращает участки бортов (в порядке fractions) и недостижимый остаток.
+
+    work_reach — «выгодный» радиус: участки растут только в его пределах, чтобы перелёт
+    не съедал вылет; клетки вне выгодного радиуса всех бортов, но в пределах reach,
+    отдаются наименее загруженному борту, который до них долетает."""
     n = len(fractions)
     if cell is None:
         cell = max(math.sqrt(area.area / 1500.0), 100.0)
@@ -70,7 +75,9 @@ def grid_partition(
     target = [f / s * total for f in fractions]
     far = cell / math.sqrt(2)
     dist = {k: [math.dist(centers[k], rb[d]) for d in range(n)] for k in pieces}
-    ok = {k: [dist[k][d] + far <= reach[d] for d in range(n)] for k in pieces}
+    ok_full = {k: [dist[k][d] + far <= reach[d] for d in range(n)] for k in pieces}
+    wr = work_reach or reach
+    ok = {k: [dist[k][d] + far <= min(reach[d], wr[d]) for d in range(n)] for k in pieces}
 
     owner: dict[tuple[int, int], int] = {}
     load = [0.0] * n
@@ -118,7 +125,9 @@ def grid_partition(
     for k in pieces:
         if k in owner:
             continue
-        avail = [d for d in range(n) if ok[k][d] and target[d] > 0]
+        avail = [d for d in range(n) if ok[k][d] and target[d] > 0] or [
+            d for d in range(n) if ok_full[k][d] and target[d] > 0
+        ]
         if avail:
             d = min(avail, key=lambda x: load[x] / target[x])
             owner[k] = d

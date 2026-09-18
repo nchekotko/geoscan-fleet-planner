@@ -623,3 +623,24 @@ def test_pareto_survives_broken_pool(monkeypatch):
     monkeypatch.setattr(pr, "ProcessPoolExecutor", Broken)
     front = pr.pareto_front(scenario("strong_wind", use_terrain=False), weights=(1.0, 0.0), eps_points=0)
     assert front
+
+
+def test_multirotor_reach_in_wind_keeps_full_coverage():
+    """Радиус действия по треугольнику скоростей: при ветре 7 м/с мультироторы долетают
+    до полос у NFZ, и demo снимается полностью (раньше радиус был занижен, покрытие 95,7 %)."""
+    res = plan(load_req(wind={"speed_ms": 7, "from_deg": 270}, use_terrain=False))
+    assert res.summary.coverage_pct > 99.9
+
+
+def test_energy_range_matches_round_trip():
+    """Радиус по заряду: полёт туда-обратно на этот радиус при худшем направлении ветра
+    занимает весь бюджет вылета без взлёта и посадки."""
+    from planner.planner import energy_range_m, round_trip_s_per_m
+    d = FLEET.drones["geoscan_gemini"]
+    p = survey_params(d, FLEET.payloads["pf1b"], SurveyRequirements(altitude_m=100))
+    w = Wind(speed_ms=7, from_deg=0)
+    r = energy_range_m(d, p, 1800, w)
+    t_ops = 100 / d.climb_rate_ms + 100 / 3.0
+    assert r * round_trip_s_per_m(max(p.speed_ms, d.cruise_speed_ms), w) == pytest.approx(1800 - t_ops, rel=1e-6)
+    # без ветра — просто V·t/2
+    assert energy_range_m(d, p, 1800, Wind()) == pytest.approx(10 * (1800 - t_ops) / 2, rel=1e-3)
