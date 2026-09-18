@@ -46,6 +46,10 @@ class PlanningError(ValueError):
     pass
 
 
+UNCOVERED_TOL_M2 = 100.0  # допуск на неснятую площадь при сравнении планов (шум геометрии)
+UNCOVERED_PENALTY = 10.0  # вес доли неснятой площади в целевой функции локального поиска
+
+
 @dataclass
 class Candidate:
     instance_id: str
@@ -85,6 +89,11 @@ class Evaluation:
     @property
     def total(self) -> float:
         return sum(r.flight_s for r in self.results)
+
+    @property
+    def uncovered_m2(self) -> float:
+        """Площадь, которую план оставляет неснятой (у NFZ и вне радиуса действия)."""
+        return self.leftover_m2 + self.unreachable_m2
 
 
 def _polys(g: BaseGeometry) -> BaseGeometry:
@@ -196,9 +205,15 @@ class Planner:
         return min(self.bases, key=lambda b: math.dist(self.bases[b], (c.x, c.y)))
 
     def _reassign_turn_gaps(
-        self, cands: list[Candidate], regions: list[BaseGeometry]
+        self, cands: list[Candidate], regions: list[BaseGeometry], n_active: int | None = None
     ) -> tuple[list[BaseGeometry], float]:
-        """Полосы у NFZ, где самолёт не может развернуться, отдаём ближайшему мультиротору."""
+        """Полосы у NFZ, где самолёт не может развернуться, отдаём ближайшему мультиротору.
+
+        Первые n_active бортов работают по плану, остальные (с пустыми участками) — резерв:
+        кусок уходит резервному мультиротору, только если ни один работающий до него
+        не долетает. Иначе при весе «налёт» = 1 весь план достаётся самолёту и кольца
+        у NFZ остаются неснятыми."""
+        n_active = len(cands) if n_active is None else n_active
         multi = [i for i, c in enumerate(cands) if c.drone.type == "multirotor"]
         regions = list(regions)
         leftover = 0.0
@@ -224,6 +239,8 @@ class Planner:
                 if not able:
                     leftover += piece.area
                     continue
+                working = [k for k in able if k < n_active or not regions[k].is_empty]
+                able = working or able
                 j = min(able, key=lambda k: regions[k].distance(piece) if not regions[k].is_empty
                         else self._far_point(piece, cands[k]))
                 regions[j] = _polys(unary_union([regions[j], piece]))
@@ -261,9 +278,16 @@ class Planner:
             unreachable = rest.area
         else:
             regions = split_by_fractions(self.area, angle, [f for _, f in active])
-        regions, leftover = self._reassign_turn_gaps([c for c, _ in active], regions)
+        # резерв для полос у NFZ — мультироторы с нулевой долей
+        spare = [c for c, f in zip(cands, fractions) if f <= 1e-6 and c.drone.type == "multirotor"]
+        workers = [c for c, _ in active] + spare
+        regions, leftover = self._reassign_turn_gaps(
+            workers, list(regions) + [Polygon()] * len(spare), n_active=len(active)
+        )
         results: list[DroneResult] = []
-        for (cand, _), region in zip(active, regions):
+        for k, (cand, region) in enumerate(zip(workers, regions)):
+            if k >= len(active) and region.is_empty:
+                continue
             base_id = cand.base_id or self._default_base(region)
             base = self.bases[base_id]
             p = cand.params
@@ -330,7 +354,9 @@ class Planner:
                     raise
         if not results:
             raise ValueError("не удалось построить план ни из одной стартовой точки")
-        return min(results, key=lambda e: e.makespan)
+        # покрытие важнее времени: сначала планы без лишней неснятой площади
+        min_unc = min(e.uncovered_m2 for e in results)
+        return min(results, key=lambda e: (e.uncovered_m2 > min_unc + UNCOVERED_TOL_M2, e.makespan))
 
     def _balance_from(self, cands: list[Candidate], fr: list[float], angle: float, iters: int) -> Evaluation:
         best = self.evaluate(cands, fr, angle)
@@ -349,7 +375,7 @@ class Planner:
                 cur = self.evaluate(cands, fr, angle)
             except ValueError:
                 break
-            if cur.makespan < best.makespan:
+            if cur.makespan < best.makespan and cur.uncovered_m2 <= best.uncovered_m2 + UNCOVERED_TOL_M2:
                 best = cur
         return best
 
@@ -357,12 +383,18 @@ class Planner:
         self, cands: list[Candidate], start: Evaluation, angle: float, w: float, cap: float | None = None
     ) -> Evaluation:
         t_ref, s_ref = start.makespan, start.total
+        area = self.area.area
 
         def score(e: Evaluation) -> float:
             j = w * e.makespan / t_ref + (1 - w) * e.total / s_ref
             if cap is not None and e.makespan > cap:
                 j += 10.0 * (e.makespan - cap) / t_ref  # штраф за нарушение ε-ограничения
-            return j
+            # полнота съёмки — жёсткое требование: доля неснятой площади штрафуется сильнее,
+            # чем любое реальное изменение времени (метод штрафных функций, Coello, 2002)
+            return j + UNCOVERED_PENALTY * e.uncovered_m2 / area
+
+        def loses_coverage(e: Evaluation) -> bool:
+            return e.uncovered_m2 > best.uncovered_m2 + UNCOVERED_TOL_M2
 
         best, best_j = start, score(start)
         # дополнительные стартовые точки: вся работа одному борту
@@ -372,8 +404,8 @@ class Planner:
                 e = self.evaluate(cands, fr, angle)
             except (ValueError, GEOSException):
                 continue
-            if e.unreachable_m2 > best.unreachable_m2 + 1.0:
-                continue  # один борт не достаёт до всей области — не считаем решением
+            if loses_coverage(e):
+                continue  # один борт не достаёт до всей области или не разворачивается у NFZ
             if score(e) < best_j - 1e-6:
                 best, best_j = e, score(e)
         n = len(cands)
@@ -398,6 +430,8 @@ class Planner:
                     except (ValueError, GEOSException):
                         continue
                     evals += 1
+                    if loses_coverage(e):
+                        continue
                     j_val = score(e)
                     if j_val < best_j - 1e-6:
                         best, best_j, improved = e, j_val, True

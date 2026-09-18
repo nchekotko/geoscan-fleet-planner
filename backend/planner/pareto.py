@@ -34,7 +34,15 @@ def _solve(args: tuple[dict, float, float | None]) -> PlanResponse | None:
         return None
 
 
+COVERAGE_TOL_PCT = 0.5  # план с покрытием ниже лучшего на столько п.п. не сравниваем по времени
+
+
 def non_dominated(plans: list[PlanResponse]) -> list[PlanResponse]:
+    """Недоминируемые планы. Сравниваем только планы с полным (как у лучшего) покрытием:
+    иначе «дешёвый» план, не снявший часть области, вытесняет полные."""
+    if plans:
+        top = max(p.summary.coverage_pct for p in plans)
+        plans = [p for p in plans if p.summary.coverage_pct >= top - COVERAGE_TOL_PCT]
     pts = sorted(plans, key=lambda p: (p.summary.makespan_s, p.summary.total_flight_s))
     front: list[PlanResponse] = []
     best_total = float("inf")
