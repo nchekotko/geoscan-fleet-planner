@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
+import shapely
 from shapely.errors import GEOSException
 from shapely.validation import make_valid
 
@@ -77,6 +78,9 @@ REACH_MARGIN = 0.10
 PROFITABLE_TRANSIT_SHARE = 0.5
 # шаг эшелонов перелёта: k-й борт летает к области и обратно на k·шаг выше высоты съёмки
 TRANSIT_LEVEL_STEP_M = 20.0
+# перебор порядка бортов одной ВПП: при большом парке — только первые обмены соседей
+MAX_ORDER_SEARCH_DRONES = 6
+MAX_ORDERS_LARGE_FLEET = 4
 TRANSIT_KINDS = ("transit", "return")
 
 
@@ -657,7 +661,10 @@ class Planner:
         время борта меняется ступенями, и одной балансировки для сравнения порядков мало."""
         start = best
         best = self._local_search(cands, best, angle, 1.0, quick=True)
-        for order in self._orders(cands):
+        orders = self._orders(cands)
+        if len(cands) > MAX_ORDER_SEARCH_DRONES:
+            orders = orders[:MAX_ORDERS_LARGE_FLEET]  # большой парк: только несколько обменов
+        for order in orders:
             try:
                 e = self._balance_from(order, [c.productivity for c in order], angle, 12)
                 e = self._local_search(order, e, angle, 1.0, quick=True)
@@ -768,6 +775,8 @@ class Planner:
             improved = False
             for i in range(n):
                 for j in range(n):
+                    if evals >= max_evals:
+                        break  # лимит оценок — и внутри прохода (при многих бортах пар сотни)
                     if i == j or best.fractions[i] <= 1e-6:
                         continue
                     fr = list(best.fractions)
@@ -866,7 +875,11 @@ class Planner:
                         strips.append(LineString(leg.points).buffer(half, cap_style="flat"))
         if not strips:
             return 0.0
-        return unary_union(strips).intersection(self.area).area
+        try:
+            return unary_union(strips).intersection(self.area).area
+        except GEOSException:
+            # численная неустойчивость GEOS на почти совпадающих рёбрах — считаем на сетке 5 см
+            return shapely.intersection(shapely.union_all(strips, grid_size=0.05), self.area, grid_size=0.05).area
 
     # ------------------------------------------------------------ рельеф
     def _terrain(self) -> Terrain | None:

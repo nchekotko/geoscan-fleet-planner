@@ -790,3 +790,16 @@ def test_request_limits():
     assert r.status_code == 422 and "км²" in r.json()["detail"]
     many = dict(body, drones=[{"id": f"d{i}", "model": "geoscan_gemini"} for i in range(60)])
     assert c.post("/api/plan", json=many).status_code == 422
+
+
+FAILURE_SCENARIOS = sorted((SCENARIO.parent.parent / "scenarios_failures").glob("*.json"))
+
+
+@pytest.mark.parametrize("path", FAILURE_SCENARIOS, ids=[p.stem for p in FAILURE_SCENARIOS])
+def test_random_failure_scenarios_now_plan(path):
+    """Сценарии, на которых случайный бенчмарк находил ошибки, теперь считаются без исключений
+    и с почти полным покрытием."""
+    data = {k: v for k, v in json.loads(path.read_text(encoding="utf-8")).items() if not k.startswith("_")}
+    data["use_terrain"] = False
+    res = plan(PlanRequest(**data))
+    assert res.summary.coverage_pct > 99.0
