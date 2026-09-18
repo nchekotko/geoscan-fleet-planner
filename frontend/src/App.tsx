@@ -530,7 +530,14 @@ export default function App() {
                 onChange={(e) => setReqField('line_spacing_m', +e.target.value)} />
             </label>
           )}
-          {req.survey_type !== 'geophysics' && (
+          {req.survey_type === 'lidar' && (
+            <label>
+              Перекрытие полос LiDAR, %
+              <input type="number" min="0" max="90" value={Math.round((req.requirements.lidar_side_overlap ?? 0.2) * 100)}
+                onChange={(e) => setReqField('lidar_side_overlap', +e.target.value / 100)} />
+            </label>
+          )}
+          {req.survey_type !== 'geophysics' && req.survey_type !== 'lidar' && (
             <label>
               Поперечное перекрытие, %
               <input type="number" min="0" max="95" value={Math.round(req.requirements.side_overlap * 100)}
@@ -550,6 +557,14 @@ export default function App() {
             Ветер, м/с
             <input type="number" min="0" max="25" value={req.wind.speed_ms}
               onChange={(e) => setReq({ ...req, wind: { ...req.wind, speed_ms: +e.target.value } })} />
+          </label>
+          <label>
+            Ветер задан
+            <select value={req.wind.ref_height_m == null ? '' : String(req.wind.ref_height_m)}
+              onChange={(e) => setReq({ ...req, wind: { ...req.wind, ref_height_m: e.target.value ? +e.target.value : null } })}>
+              <option value="">на высоте полёта</option>
+              <option value="10">у земли, 10 м (метеостанция)</option>
+            </select>
           </label>
           <label>
             Откуда дует, °

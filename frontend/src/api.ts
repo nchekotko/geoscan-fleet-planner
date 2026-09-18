@@ -23,6 +23,8 @@ export interface Requirements {
   side_overlap: number
   altitude_m?: number | null
   lidar_density_pts_m2: number
+  /** перекрытие полос LiDAR (по руководству 401 — 10–20 %) */
+  lidar_side_overlap?: number
   line_spacing_m?: number | null
   altitude_ceiling_m?: number | null
 }
@@ -36,7 +38,8 @@ export interface PlanRequest {
   drones: DroneInstance[]
   survey_type: SurveyType
   requirements: Requirements
-  wind: { speed_ms: number; from_deg: number }
+  /** ref_height_m — высота, на которой задан ветер (метеостанция); null — ветер на рабочей высоте */
+  wind: { speed_ms: number; from_deg: number; ref_height_m?: number | null }
   time_weight: number
   reserve: number
   nfz_buffer_m: number

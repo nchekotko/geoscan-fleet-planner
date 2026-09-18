@@ -574,6 +574,7 @@ const REQUIREMENT_NUMBERS = [
   'side_overlap',
   'altitude_m',
   'lidar_density_pts_m2',
+  'lidar_side_overlap',
   'line_spacing_m',
   'altitude_ceiling_m',
 ]
