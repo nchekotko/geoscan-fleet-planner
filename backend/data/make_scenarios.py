@@ -51,7 +51,7 @@ SCENARIOS = {
             {"id": "401-L2", "model": "geoscan_401", "payload": "alphaair_450"},
         ],
         "survey_type": "lidar",
-        "requirements": {"lidar_density_pts_m2": 100, "side_overlap": 0.3},
+        "requirements": {"lidar_density_pts_m2": 100, "lidar_side_overlap": 0.2},
         "wind": {"speed_ms": 3, "from_deg": 90},
         "time_weight": 1.0,
     },

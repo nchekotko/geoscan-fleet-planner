@@ -708,3 +708,28 @@ def test_geoscan_401_matches_passport_area_per_flight(gsd, passport_km2):
     dr = plan(PlanRequest(**d)).drones[0]
     per = [s.survey_length_m * dr.params.line_spacing_m / 1e6 for s in dr.sorties][:-1]
     assert 0.85 <= sum(per) / len(per) / passport_km2 <= 1.05
+
+
+def test_wind_profile_from_reference_height():
+    """Ветер, заданный у земли (10 м), на рабочей высоте сильнее: v·(h/10)^0,14."""
+    w = Wind(speed_ms=5, from_deg=270, ref_height_m=10)
+    assert w.at(150).speed_ms == pytest.approx(5 * 15 ** 0.14)
+    assert Wind(speed_ms=5).at(150).speed_ms == 5  # без высоты задания — ветер уже на рабочей высоте
+
+
+def test_ground_wind_excludes_drone_over_limit():
+    """7 м/с у земли на высоте Gemini (~200 м) — 10,7 м/с, больше его предела 10 м/с:
+    Gemini исключается с указанием высоты, остальные работают."""
+    res = plan(scenario("strong_wind", use_terrain=False,
+                        wind={"speed_ms": 7, "from_deg": 0, "ref_height_m": 10}))
+    gemini = [e.reason for e in res.excluded if e.drone_id == "gemini-1"]
+    assert gemini and "на высоте" in gemini[0]
+    assert res.drones
+
+
+def test_lidar_uses_lidar_overlap():
+    d = FLEET.drones["geoscan_401"]
+    p20 = survey_params(d, FLEET.payloads["agm_ms3"], SurveyRequirements())
+    p50 = survey_params(d, FLEET.payloads["agm_ms3"], SurveyRequirements(lidar_side_overlap=0.5))
+    assert p20.line_spacing_m == pytest.approx(p20.swath_m * 0.8)
+    assert p50.line_spacing_m < p20.line_spacing_m

@@ -118,6 +118,7 @@ class Candidate:
     productivity: float  # м²/с с учётом смены АКБ
     reach_m: float = math.inf  # радиус действия от базы: заряд туда-обратно и радиоканал
     work_reach_m: float = math.inf  # «выгодный» радиус: перелёт не больше половины вылета
+    wind: Wind | None = None  # ветер на рабочей высоте борта
 
 
 @dataclass
@@ -240,30 +241,34 @@ class Planner:
                     ExcludedDrone(drone_id=inst.id, reason=f"{drone.name}: нет нагрузки для съёмки «{req.survey_type}»")
                 )
                 continue
-            wind_problem = check_wind(drone, req.wind)
-            if wind_problem:
-                self.excluded.append(ExcludedDrone(drone_id=inst.id, reason=wind_problem))
-                continue
             try:
+                # высота съёмки от скорости не зависит — по ней пересчитываем ветер на рабочую высоту
+                h = survey_params(drone, payload, req.requirements).altitude_agl_m
+                wind = req.wind.at(h)
                 # против ветра нужна путевая скорость ≥ ~2 м/с
-                params = survey_params(drone, payload, req.requirements, min_speed=req.wind.speed_ms + 2.0)
+                params = survey_params(drone, payload, req.requirements, min_speed=wind.speed_ms + 2.0)
             except SurveyInfeasible as e:
                 self.excluded.append(ExcludedDrone(drone_id=inst.id, reason=str(e)))
                 continue
+            at_h = f" (на высоте {h:.0f} м)" if req.wind.ref_height_m is not None else ""
+            wind_problem = check_wind(drone, wind)
+            if wind_problem:
+                self.excluded.append(ExcludedDrone(drone_id=inst.id, reason=wind_problem + at_h))
+                continue
             # против ветра и поперёк него линию пути держать можно только при V > W
-            if params.speed_ms <= req.wind.speed_ms + 0.5:
+            if params.speed_ms <= wind.speed_ms + 0.5:
                 self.excluded.append(ExcludedDrone(
                     drone_id=inst.id,
                     reason=f"{drone.name}: скорость съёмки {params.speed_ms:.1f} м/с не выше ветра "
-                           f"{req.wind.speed_ms:.1f} м/с (увеличьте GSD или снизьте перекрытие)",
+                           f"{wind.speed_ms:.1f} м/с{at_h} (увеличьте GSD или снизьте перекрытие)",
                 ))
                 continue
-            budget = usable_flight_time_s(drone, req.wind, req.reserve, payload.endurance_factor)
+            budget = usable_flight_time_s(drone, wind, req.reserve, payload.endurance_factor)
             overhead = params.altitude_agl_m / drone.climb_rate_ms * 2 + (180 if drone.type == "fixed_wing" else 0)
             availability = max(budget - overhead, 1.0) / (budget + drone.swap_time_min * 60)
             productivity = params.speed_ms * params.line_spacing_m * availability
             # радиус действия: туда-обратно при худшем направлении ветра, с запасом, и радиоканал
-            range_m = energy_range_m(drone, params, budget, req.wind)
+            range_m = energy_range_m(drone, params, budget, wind)
             reach = min(range_m * (1 - REACH_MARGIN), drone.radio_range_km * 1000)
             # борт, который не долетает ни до одной точки области, работать не может
             gap = self.area.distance(Point(self.bases[inst.base_id or self._default_base(self.area)]))
@@ -275,7 +280,7 @@ class Planner:
                 ))
                 continue
             out.append(Candidate(inst.id, drone, payload, params, budget, inst.base_id, productivity, reach,
-                                 min(reach, range_m * PROFITABLE_TRANSIT_SHARE)))
+                                 min(reach, range_m * PROFITABLE_TRANSIT_SHARE), wind))
         return out
 
     # ------------------------------------------------------------- оценка
@@ -391,7 +396,7 @@ class Planner:
                 # секущие маршруты поперёк основных галсов (геофизика)
                 ties = sweep_passes(region, angle + math.pi / 2, p.tie_line_spacing_m)
                 route += order_passes(ties, route[-1].b if route else base, kind="tie")
-            builder = SortieBuilder(cand.drone, p.speed_ms, p.altitude_agl_m, self.req.wind, cand.budget_s, self.router)
+            builder = SortieBuilder(cand.drone, p.speed_ms, p.altitude_agl_m, cand.wind or self.req.wind, cand.budget_s, self.router)
             sorties = builder.build(route, base, base_id)
             finish = schedule(sorties, cand.drone.swap_time_min * 60, launch[cand.instance_id])
             results.append(DroneResult(cand, region, base_id, sorties, finish))
@@ -514,7 +519,7 @@ class Planner:
         for c in [lead] + ([] if large else [c for c in self.candidates if c is not lead]):
             key = (c.drone.id, round(c.params.line_spacing_m, 1), round(c.params.speed_ms, 2))
             specs.setdefault(key, (c.params.line_spacing_m, c.drone, c.params.speed_ms))
-        ranked = ranked_directions(self.area, list(specs.values()), self.req.wind)
+        ranked = ranked_directions(self.area, list(specs.values()), lead.wind or self.req.wind)
         if not ranked[0]:
             raise PlanningError(f"{lead.drone.name}: ветер не позволяет выполнить съёмку ни в одном направлении")
         angles: list[float] = []
@@ -555,7 +560,8 @@ class Planner:
         """Направление галсов по оценке для самого производительного борта и порядок бортов
         (одностартовый вариант, используется бенчмарком для простых baseline)."""
         lead = max(self.candidates, key=lambda c: c.productivity)
-        angle, _, _ = best_direction(self.area, lead.params.line_spacing_m, lead.drone, lead.params.speed_ms, self.req.wind)
+        angle, _, _ = best_direction(self.area, lead.params.line_spacing_m, lead.drone, lead.params.speed_ms,
+                                     lead.wind or self.req.wind)
         return self._order(angle), angle
 
     def _order(self, angle: float) -> list[Candidate]:
@@ -788,9 +794,10 @@ class Planner:
         d = res.cand.drone
         p = res.cand.params
         sites = {**self.bases, **self.reserve_sites}
-        builder = SortieBuilder(d, p.speed_ms, p.altitude_agl_m, self.req.wind, res.cand.budget_s, self.router)
+        wind = res.cand.wind or self.req.wind
+        builder = SortieBuilder(d, p.speed_ms, p.altitude_agl_m, wind, res.cand.budget_s, self.router)
         # резерв заряда в секундах: то, что осталось сверх бюджета вылета
-        reserve_s = usable_flight_time_s(d, self.req.wind, 0.0, res.cand.payload.endurance_factor) - res.cand.budget_s
+        reserve_s = usable_flight_time_s(d, wind, 0.0, res.cand.payload.endurance_factor) - res.cand.budget_s
         for s in res.sorties:
             builder.divert_check(s, sites)
             if s.max_divert_s > reserve_s:

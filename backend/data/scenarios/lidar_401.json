@@ -54,7 +54,7 @@
  "survey_type": "lidar",
  "requirements": {
   "lidar_density_pts_m2": 100,
-  "side_overlap": 0.3
+  "lidar_side_overlap": 0.2
  },
  "wind": {
   "speed_ms": 3,

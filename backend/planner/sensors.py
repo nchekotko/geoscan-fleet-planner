@@ -25,6 +25,8 @@ class SurveyRequirements(BaseModel):
     side_overlap: float = Field(0.65, ge=0.0, le=0.95)
     altitude_m: float | None = Field(None, ge=0.0)      # явная высота AGL, перекрывает расчёт из GSD
     lidar_density_pts_m2: float = Field(50.0, gt=0.0)
+    # перекрытие полос LiDAR: по руководству Геоскан 401 — 10–20 % (у камер — side_overlap)
+    lidar_side_overlap: float = Field(0.2, ge=0.0, le=0.9)
     line_spacing_m: float | None = Field(None, gt=0.0)  # геофизика
     altitude_ceiling_m: float | None = Field(None, ge=0.0)  # потолок разрешённого объёма (AGL)
 
@@ -115,7 +117,7 @@ def lidar_params(drone: DroneModel, lidar: Payload, req: SurveyRequirements, min
     h = req.altitude_m or lidar.recommended_alt_m or 100.0
     h = min(max(h, lo), hi)
     swath = 2 * h * math.tan(math.radians(lidar.effective_fov_deg or 70.0) / 2)
-    spacing = swath * (1 - req.side_overlap)
+    spacing = swath * (1 - req.lidar_side_overlap)
     # Скорость, при которой обеспечивается плотность в одной полосе.
     v_max = lidar.pulse_rate_hz / (req.lidar_density_pts_m2 * swath)
     speed = min(_cruise(drone, min_speed), v_max)
