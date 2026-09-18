@@ -1,0 +1,208 @@
+# Датасет парка БВС и полезных нагрузок.
+# Значения без пометки взяты из паспортов (источник указан в `source`).
+# Поля из списка `assumed` — допущения команды (см. PLAN.md, раздел 1.1).
+
+sources:
+  g201: "Руководство Геоскан 201, прил. «Технические характеристики», с. 115–117 — https://download.geoscan.ru/site-files/201/Geoscan_201_Manual.pdf"
+  gemini: "Gemini Specs — https://download.geoscan.ru/site-files/gemini/Gemini_Specs_EN_RUS.pdf?v2"
+  g801: "Буклет Геоскан 801, с. 3–4 — https://download.geoscan.ru/site-files/801/Geoscan_801.pdf?v2"
+  g401: "Руководство Геоскан 401, с. 77, 102, 125–130 — https://download.geoscan.ru/site-files/401/Geoscan_401_Manual.pdf"
+  sony_rx1r2: "Sony DSC-RX1RM2: 35 мм, 7952×5304 (паспорт камеры)"
+
+payloads:
+  sony_rx1rm2:
+    name: "Sony DSC-RX1RM2"
+    kind: camera
+    survey_types: [rgb]
+    sensor_w_mm: 35.9
+    sensor_h_mm: 24.0
+    image_w_px: 7952
+    image_h_px: 5304
+    focal_mm: 35.0
+    min_trigger_interval_s: 1.0
+    source: g201
+    assumed: [focal_mm, image_w_px, image_h_px, min_trigger_interval_s]
+  sony_rx1rm3:
+    name: "Sony DSC-RX1RM3"
+    kind: camera
+    survey_types: [rgb]
+    sensor_w_mm: 35.9
+    sensor_h_mm: 24.0
+    image_w_px: 9504
+    image_h_px: 6336
+    focal_mm: 35.0
+    min_trigger_interval_s: 1.0
+    source: g401
+    assumed: [focal_mm, image_w_px, image_h_px, min_trigger_interval_s]
+  pf1b:
+    name: "Geoscan PF1B"
+    kind: camera
+    survey_types: [rgb]
+    sensor_w_mm: 23.5
+    sensor_h_mm: 15.6
+    image_w_px: 6000
+    image_h_px: 4000
+    focal_mm: 20.0
+    min_trigger_interval_s: 1.0
+    source: gemini
+    assumed: [min_trigger_interval_s]
+  pollux:
+    name: "Geoscan Pollux (мультиспектральная)"
+    kind: camera
+    survey_types: [multispectral]
+    # 1440×1080 при пикселе 3,45 мкм
+    sensor_w_mm: 4.968
+    sensor_h_mm: 3.726
+    image_w_px: 1440
+    image_h_px: 1080
+    focal_mm: 8.0
+    min_trigger_interval_s: 1.0
+    source: gemini
+    assumed: [min_trigger_interval_s]
+  g801_rgb:
+    name: "Геоскан 801, камера видимого спектра (широкоугольная)"
+    kind: camera
+    survey_types: [rgb]
+    # 1/2.3", 12 Мп
+    sensor_w_mm: 6.17
+    sensor_h_mm: 4.55
+    image_w_px: 4000
+    image_h_px: 3000
+    focal_mm: 4.35
+    min_trigger_interval_s: 2.0
+    source: g801
+    assumed: [sensor_w_mm, sensor_h_mm, image_w_px, image_h_px, min_trigger_interval_s]
+  g801_thermal:
+    name: "Геоскан 801, тепловизор 640×512"
+    kind: camera
+    survey_types: [thermal]
+    # пиксель 12 мкм — допущение
+    sensor_w_mm: 7.68
+    sensor_h_mm: 6.144
+    image_w_px: 640
+    image_h_px: 512
+    focal_mm: 9.1
+    min_trigger_interval_s: 1.0
+    source: g801
+    assumed: [sensor_w_mm, sensor_h_mm, min_trigger_interval_s]
+  agm_ms3:
+    name: "Лазерный сканер AGM-MS3"
+    kind: lidar
+    survey_types: [lidar]
+    pulse_rate_hz: 600000
+    max_range_m: 200
+    # сканер 360°, для полосы съёмки берём эффективный сектор
+    effective_fov_deg: 90
+    recommended_alt_m: 100
+    source: g401
+    assumed: [effective_fov_deg, recommended_alt_m]
+  alphaair_450:
+    name: "Лазерный сканер AlphaAir 450"
+    kind: lidar
+    survey_types: [lidar]
+    pulse_rate_hz: 720000
+    max_range_m: 450
+    effective_fov_deg: 70.4
+    recommended_alt_m: 120
+    source: g401
+    assumed: [recommended_alt_m]
+  geoshark:
+    name: "Квантовый магнитометр Geoshark"
+    kind: magnetometer
+    survey_types: [geophysics]
+    sample_rate_hz: 1000
+    recommended_alt_m: 30
+    recommended_line_spacing_m: 50
+    tie_line_factor: 10
+    source: g401
+    assumed: [recommended_alt_m, recommended_line_spacing_m, tie_line_factor]
+  gs1:
+    name: "Гамма-спектрометр GS-1"
+    kind: gamma
+    survey_types: [geophysics]
+    recommended_alt_m: 30
+    recommended_line_spacing_m: 50
+    tie_line_factor: 10
+    source: g401
+    assumed: [recommended_alt_m, recommended_line_spacing_m, tie_line_factor]
+
+drones:
+  geoscan_201:
+    name: "Геоскан 201"
+    type: fixed_wing
+    airspeed_min_ms: 17.8   # 64 км/ч
+    airspeed_max_ms: 36.1   # 130 км/ч
+    cruise_speed_ms: 19.4   # 210 км / 3 ч
+    climb_rate_ms: 3.0
+    endurance_min: 180
+    max_route_km: 210
+    battery_wh: 740         # 18,5 В × 40 А·ч
+    max_wind_ms: 12
+    min_alt_agl_m: 100
+    max_alt_amsl_m: 4000
+    max_bank_deg: 30
+    radio_range_km: 40
+    takeoff: catapult_upwind
+    landing: parachute_upwind
+    swap_time_min: 20
+    payloads: [sony_rx1rm2, pollux]
+    source: g201
+    assumed: [cruise_speed_ms, climb_rate_ms, max_bank_deg, swap_time_min]
+  geoscan_gemini:
+    name: "Геоскан Gemini"
+    type: multirotor
+    airspeed_min_ms: 0
+    airspeed_max_ms: 15
+    cruise_speed_ms: 10
+    climb_rate_ms: 5
+    endurance_min: 40
+    battery_wh: 144.7
+    max_wind_ms: 10
+    min_alt_agl_m: 20
+    max_alt_agl_m: 500
+    max_alt_amsl_m: 4000
+    radio_range_km: 5
+    takeoff: vertical
+    landing: vertical
+    swap_time_min: 10
+    payloads: [pf1b, pollux]
+    source: gemini
+    assumed: [cruise_speed_ms, min_alt_agl_m, swap_time_min]
+  geoscan_801:
+    name: "Геоскан 801"
+    type: multirotor
+    airspeed_min_ms: 0
+    airspeed_max_ms: 15
+    cruise_speed_ms: 10
+    climb_rate_ms: 5
+    endurance_min: 40
+    battery_wh: 100
+    max_wind_ms: 10
+    min_alt_agl_m: 20
+    max_alt_amsl_m: 4000
+    radio_range_km: 10
+    takeoff: vertical
+    landing: vertical
+    swap_time_min: 10
+    payloads: [g801_rgb, g801_thermal]
+    source: g801
+    assumed: [cruise_speed_ms, climb_rate_ms, battery_wh, min_alt_agl_m, swap_time_min]
+  geoscan_401:
+    name: "Геоскан 401"
+    type: multirotor
+    airspeed_min_ms: 0
+    airspeed_max_ms: 15     # 54 км/ч
+    cruise_speed_ms: 10
+    climb_rate_ms: 3
+    endurance_min: 60
+    battery_wh: 740         # 37 В × 20 А·ч
+    max_wind_ms: 12
+    min_alt_agl_m: 25
+    max_alt_amsl_m: 4000
+    radio_range_km: 40
+    takeoff: vertical
+    landing: vertical
+    swap_time_min: 10
+    payloads: [sony_rx1rm3, agm_ms3, alphaair_450, geoshark, gs1]
+    source: g401
+    assumed: [cruise_speed_ms, climb_rate_ms, swap_time_min]
