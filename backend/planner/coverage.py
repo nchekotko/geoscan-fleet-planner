@@ -88,39 +88,95 @@ def candidate_angles(area: BaseGeometry, step_deg: float = 10.0) -> list[float]:
 
 
 def estimate_coverage_time(
-    passes: list[Pass], angle: float, spacing: float, drone: DroneModel, speed: float, wind: Wind
+    passes: list[Pass], angle: float, spacing: float, drone: DroneModel, speed: float, wind: Wind,
+    scale: float = 1.0,
 ) -> float | None:
-    """Оценка времени съёмки: галсы идут попеременно туда и обратно + развороты."""
+    """Оценка времени съёмки: галсы идут попеременно туда и обратно + развороты.
+    scale — пересчёт галсов, построенных с другим шагом s₀, на шаг spacing: длина галсов
+    и число линий ∝ 1/шаг, т. е. scale = s₀ / spacing."""
     if not passes:
         return 0.0
     t_fwd = segment_time(1.0, speed, angle, wind)
     t_back = segment_time(1.0, speed, angle + math.pi, wind)
     if t_fwd is None or t_back is None:
         return None
-    total_len = sum(p.length for p in passes)
+    total_len = sum(p.length for p in passes) * scale
     t = total_len * (t_fwd + t_back) / 2
     n_lines = len({p.line for p in passes})
     extra_segments = len(passes) - n_lines
-    t += (n_lines - 1) * turn_time(drone, speed, spacing)
+    t += max(n_lines * scale - 1, 0.0) * turn_time(drone, speed, spacing)
     # переходы между кусками одной линии через дыры — грубо, как лишний разворот
-    t += extra_segments * turn_time(drone, speed, spacing)
+    t += extra_segments * scale * turn_time(drone, speed, spacing)
     return t
+
+
+def ranked_directions(
+    area: Polygon | MultiPolygon, specs: list[tuple[float, DroneModel, float]], wind: Wind
+) -> list[list[tuple[float, float]]]:
+    """Для каждого борта specs = [(шаг галсов, модель, скорость), …] — кандидаты направления
+    с оценкой времени съёмки (угол, t), от лучшего к худшему; направления, в которых ветер
+    не даёт держать линию пути, отброшены. Галсы строятся один раз, с шагом первого борта,
+    для остальных время пересчитывается на их шаг (estimate_coverage_time, scale)."""
+    out: list[list[tuple[float, float]]] = [[] for _ in specs]
+    s0 = specs[0][0]
+    for ang in candidate_angles(area):
+        passes = sweep_passes(area, ang, s0)
+        for rk, (spacing, drone, speed) in zip(out, specs):
+            t = estimate_coverage_time(passes, ang, spacing, drone, speed, wind, scale=s0 / spacing)
+            if t is not None:
+                rk.append((ang, t))
+    for rk in out:
+        rk.sort(key=lambda x: x[1])  # сортировка устойчивая: при равенстве — меньший угол
+    return out
 
 
 def best_direction(
     area: Polygon | MultiPolygon, spacing: float, drone: DroneModel, speed: float, wind: Wind
 ) -> tuple[float, list[Pass], float]:
-    best: tuple[float, list[Pass], float] | None = None
-    for ang in candidate_angles(area):
-        passes = sweep_passes(area, ang, spacing)
-        t = estimate_coverage_time(passes, ang, spacing, drone, speed, wind)
-        if t is None:
-            continue
-        if best is None or t < best[2]:
-            best = (ang, passes, t)
-    if best is None:
+    ranked = ranked_directions(area, [(spacing, drone, speed)], wind)[0]
+    if not ranked:
         raise ValueError(f"{drone.name}: ветер не позволяет выполнить съёмку ни в одном направлении")
-    return best
+    ang, t = ranked[0]
+    return ang, sweep_passes(area, ang, spacing), t
+
+
+def same_direction(a: float, b: float, tol: float) -> bool:
+    """Галсы под углами a и b (рад) совпадают с точностью tol: направление берётся по модулю π."""
+    d = abs(a - b) % math.pi
+    return min(d, math.pi - d) < tol
+
+
+def wind_axes(wind: Wind) -> list[float]:
+    """Направления вдоль и поперёк ветра. Вдоль — галсы попеременно по ветру и против него,
+    поперёк — без продольной составляющей, но со сносом (Coombes et al., 2017)."""
+    if wind.speed_ms <= 0:
+        return []
+    wx, wy = wind.vector()
+    a = math.atan2(wy, wx) % math.pi
+    return [a, (a + math.pi / 2) % math.pi]
+
+
+def rectangle_axis(area: BaseGeometry) -> list[float]:
+    """Длинная сторона минимального ограничивающего прямоугольника (rotating calipers,
+    Toussaint, 1983): у вытянутых областей галсы вдоль неё дают меньше разворотов."""
+    rect = area.minimum_rotated_rectangle
+    if not isinstance(rect, Polygon):
+        return []
+    c = list(rect.exterior.coords)
+    p, q = max(zip(c, c[1:]), key=lambda e: math.dist(*e))
+    return [math.atan2(q[1] - p[1], q[0] - p[0]) % math.pi]
+
+
+def distinct_directions(angles: list[float], k: int, tol_deg: float = 5.0) -> list[float]:
+    """Первые k попарно различных (с точностью tol_deg) направлений в порядке приоритета."""
+    tol = math.radians(tol_deg)
+    out: list[float] = []
+    for a in angles:
+        if len(out) >= k:
+            break
+        if not any(same_direction(a, b, tol) for b in out):
+            out.append(a)
+    return out
 
 
 def boustrophedon_cells(passes: list[Pass]) -> list[list[Pass]]:
