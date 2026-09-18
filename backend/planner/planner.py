@@ -258,7 +258,7 @@ class Planner:
                            f"{req.wind.speed_ms:.1f} м/с (увеличьте GSD или снизьте перекрытие)",
                 ))
                 continue
-            budget = usable_flight_time_s(drone, req.wind, req.reserve)
+            budget = usable_flight_time_s(drone, req.wind, req.reserve, payload.endurance_factor)
             overhead = params.altitude_agl_m / drone.climb_rate_ms * 2 + (180 if drone.type == "fixed_wing" else 0)
             availability = max(budget - overhead, 1.0) / (budget + drone.swap_time_min * 60)
             productivity = params.speed_ms * params.line_spacing_m * availability
@@ -790,7 +790,7 @@ class Planner:
         sites = {**self.bases, **self.reserve_sites}
         builder = SortieBuilder(d, p.speed_ms, p.altitude_agl_m, self.req.wind, res.cand.budget_s, self.router)
         # резерв заряда в секундах: то, что осталось сверх бюджета вылета
-        reserve_s = usable_flight_time_s(d, self.req.wind, 0.0) - res.cand.budget_s
+        reserve_s = usable_flight_time_s(d, self.req.wind, 0.0, res.cand.payload.endurance_factor) - res.cand.budget_s
         for s in res.sorties:
             builder.divert_check(s, sites)
             if s.max_divert_s > reserve_s:

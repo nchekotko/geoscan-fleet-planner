@@ -32,8 +32,11 @@ payloads:
     image_h_px: 6336
     focal_mm: 35.0
     min_trigger_interval_s: 1.0
+    # калибровка по паспорту 401: «площадь фотосъёмки за 1 полёт» 0,95 км² при 2 см/пикс
+    # (руководство 401, с. 125): при резерве 20 % и перекрытиях 80/70 модель даёт 0,90–0,96 паспорта
+    endurance_factor: 0.8
     source: g401
-    assumed: [focal_mm, image_w_px, image_h_px, min_trigger_interval_s]
+    assumed: [focal_mm, image_w_px, image_h_px, min_trigger_interval_s, endurance_factor]
   pf1b:
     name: "Geoscan PF1B"
     kind: camera
@@ -94,8 +97,11 @@ payloads:
     # сканер 360°, для полосы съёмки берём эффективный сектор
     effective_fov_deg: 90
     recommended_alt_m: 100
+    # калибровка по паспорту 401: «площадь фотосъёмки за 1 полёт» 0,95 км² при 2 см/пикс
+    # (руководство 401, с. 125): при резерве 20 % и перекрытиях 80/70 модель даёт 0,90–0,96 паспорта
+    endurance_factor: 0.8
     source: g401
-    assumed: [effective_fov_deg, recommended_alt_m]
+    assumed: [effective_fov_deg, recommended_alt_m, endurance_factor]
   alphaair_450:
     name: "Лазерный сканер AlphaAir 450"
     kind: lidar
@@ -104,8 +110,11 @@ payloads:
     max_range_m: 450
     effective_fov_deg: 70.4
     recommended_alt_m: 120
+    # калибровка по паспорту 401: «площадь фотосъёмки за 1 полёт» 0,95 км² при 2 см/пикс
+    # (руководство 401, с. 125): при резерве 20 % и перекрытиях 80/70 модель даёт 0,90–0,96 паспорта
+    endurance_factor: 0.8
     source: g401
-    assumed: [recommended_alt_m]
+    assumed: [recommended_alt_m, endurance_factor]
   geoshark:
     name: "Квантовый магнитометр Geoshark"
     kind: magnetometer
@@ -114,8 +123,11 @@ payloads:
     recommended_alt_m: 30
     recommended_line_spacing_m: 50
     tie_line_factor: 10
+    # калибровка по паспорту 401: «площадь фотосъёмки за 1 полёт» 0,95 км² при 2 см/пикс
+    # (руководство 401, с. 125): при резерве 20 % и перекрытиях 80/70 модель даёт 0,90–0,96 паспорта
+    endurance_factor: 0.8
     source: g401
-    assumed: [recommended_alt_m, recommended_line_spacing_m, tie_line_factor]
+    assumed: [recommended_alt_m, recommended_line_spacing_m, tie_line_factor, endurance_factor]
   gs1:
     name: "Гамма-спектрометр GS-1"
     kind: gamma
@@ -123,8 +135,11 @@ payloads:
     recommended_alt_m: 30
     recommended_line_spacing_m: 50
     tie_line_factor: 10
+    # калибровка по паспорту 401: «площадь фотосъёмки за 1 полёт» 0,95 км² при 2 см/пикс
+    # (руководство 401, с. 125): при резерве 20 % и перекрытиях 80/70 модель даёт 0,90–0,96 паспорта
+    endurance_factor: 0.8
     source: g401
-    assumed: [recommended_alt_m, recommended_line_spacing_m, tie_line_factor]
+    assumed: [recommended_alt_m, recommended_line_spacing_m, tie_line_factor, endurance_factor]
 
 drones:
   geoscan_201:

@@ -33,6 +33,8 @@ class Payload(BaseModel):
     recommended_alt_m: float | None = None
     recommended_line_spacing_m: float | None = None
     tie_line_factor: int | None = None
+    # доля паспортной продолжительности полёта борта с этой нагрузкой (масса, питание)
+    endurance_factor: float = 1.0
     sample_rate_hz: float | None = None
     source: str = ""
     assumed: list[str] = Field(default_factory=list)

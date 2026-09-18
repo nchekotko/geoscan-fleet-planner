@@ -14,8 +14,11 @@ from .wind import Wind
 WIND_PENALTY_AT_LIMIT = 0.30
 
 
-def usable_flight_time_s(drone: DroneModel, wind: Wind, reserve: float = 0.2) -> float:
-    t = drone.endurance_min * 60 * (1 - reserve)
+def usable_flight_time_s(
+    drone: DroneModel, wind: Wind, reserve: float = 0.2, endurance_factor: float = 1.0
+) -> float:
+    """endurance_factor — поправка продолжительности на нагрузку (Payload.endurance_factor)."""
+    t = drone.endurance_min * 60 * endurance_factor * (1 - reserve)
     if drone.type == "multirotor" and drone.max_wind_ms > 0:
         k = min(wind.speed_ms / drone.max_wind_ms, 1.0)
         t *= 1 - WIND_PENALTY_AT_LIMIT * k * k

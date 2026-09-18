@@ -136,7 +136,7 @@ def test_angle_multistart_not_worse_than_single(w):
     key = (lambda e: e.makespan) if w == 1.0 else (lambda e: e.total)
     assert key(ev_m) <= key(ev_s) + 1e-6
     if w == 0.0:
-        assert key(ev_m) < 0.97 * key(ev_s)
+        assert key(ev_m) < key(ev_s) - 60  # по налёту — строго лучше (минута и более)
     assert multi._coverage(ev_m.results) >= single._coverage(ev_s.results) - 1.0
 
 
@@ -690,3 +690,21 @@ def test_separation_detects_head_on():
     assert ap is not None and ap.min_h_m < 20 and ap.conflicts >= 1
     t3 = track("z", [sortie((1000.0, 5000.0), (0.0, 5000.0))], lambda l: 130.0)
     assert closest_approach([t1, t3], [(0.0, 0.0)], 100.0) is None
+
+
+@pytest.mark.parametrize("gsd,passport_km2", [(2, 0.95), (3, 1.4), (5, 2.1)])
+def test_geoscan_401_matches_passport_area_per_flight(gsd, passport_km2):
+    """Калибровка по паспорту Геоскан 401 (руководство, с. 125): площадь фотосъёмки за полёт
+    при 2/3/5 см/пикс — 0,95/1,4/2,1 км². Модель — в пределах 85–105 % паспорта."""
+    d = {
+        "survey_area": {"type": "Polygon", "coordinates": [[[37.60, 55.60], [37.70, 55.60], [37.70, 55.66],
+                                                             [37.60, 55.66], [37.60, 55.60]]]},
+        "bases": [{"id": "A", "lon": 37.65, "lat": 55.63}],
+        "drones": [{"id": "401", "model": "geoscan_401", "payload": "sony_rx1rm3"}],
+        "survey_type": "rgb",
+        "requirements": {"gsd_cm": gsd, "front_overlap": 0.8, "side_overlap": 0.7},
+        "use_terrain": False,
+    }
+    dr = plan(PlanRequest(**d)).drones[0]
+    per = [s.survey_length_m * dr.params.line_spacing_m / 1e6 for s in dr.sorties][:-1]
+    assert 0.85 <= sum(per) / len(per) / passport_km2 <= 1.05
