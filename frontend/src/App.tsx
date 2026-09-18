@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 import MapView, { DRONE_COLORS, type DrawMode } from './MapView'
 import { api, type Fleet, type PlanRequest, type PlanResponse, type SurveyType } from './api'
+import { Gantt, ParetoChart } from './charts'
 
 const SURVEY_TYPES: { id: SurveyType; label: string }[] = [
   { id: 'rgb', label: 'RGB' },
@@ -45,6 +46,8 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [fitKey, setFitKey] = useState(0)
+  const [front, setFront] = useState<PlanResponse[] | null>(null)
+  const [paretoBusy, setParetoBusy] = useState(false)
 
   useEffect(() => {
     api.fleet().then(setFleet).catch((e) => setError(`API недоступен: ${e.message}`))
@@ -56,12 +59,14 @@ export default function App() {
     const s = await api.scenario(name)
     setReq({ ...EMPTY, ...s, requirements: { ...EMPTY.requirements, ...s.requirements } })
     setPlan(null)
+    setFront(null)
     setFitKey((k) => k + 1)
   }
 
   const onDrawn = (mode: Exclude<DrawMode, null>, g: GeoJSON.Polygon | { lon: number; lat: number }) => {
     setDrawMode(null)
     setPlan(null)
+    setFront(null)
     setReq((r) => {
       if ('type' in g) {
         if (mode === 'survey') return { ...r, survey_area: g }
@@ -95,6 +100,21 @@ export default function App() {
       setPlan(null)
     } finally {
       setBusy(false)
+    }
+  }
+
+  const runPareto = async () => {
+    setParetoBusy(true)
+    setError(null)
+    try {
+      const f = await api.pareto(req)
+      setFront(f)
+      // по умолчанию показываем самый быстрый план фронта
+      setPlan(f[0] ?? null)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setParetoBusy(false)
     }
   }
 
@@ -136,13 +156,45 @@ export default function App() {
               </button>
             ))}
           </div>
-          <p className="hint">
-            Запретных зон: {req.no_fly_zones.length} · ВПП: {req.bases.map((b) => b.id).join(', ') || '—'} · резервных:{' '}
-            {req.reserve_sites.length}{' '}
-            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null) }}>
+          <div className="objects">
+            {req.survey_area && (
+              <span className="chip">
+                область съёмки
+                <button className="link" onClick={() => setReq({ ...req, survey_area: null })}>✕</button>
+              </span>
+            )}
+            {req.allowed_area && (
+              <span className="chip">
+                разрешённая зона
+                <button className="link" onClick={() => setReq({ ...req, allowed_area: null })}>✕</button>
+              </span>
+            )}
+            {req.no_fly_zones.map((_, i) => (
+              <span className="chip nfz" key={`z${i}`}>
+                NFZ {i + 1}
+                <button className="link" onClick={() => setReq({ ...req, no_fly_zones: req.no_fly_zones.filter((_, j) => j !== i) })}>✕</button>
+              </span>
+            ))}
+            {req.bases.map((b, i) => (
+              <span className="chip" key={`b${b.id}`}>
+                ВПП {b.id}
+                <button className="link" onClick={() => setReq({
+                  ...req,
+                  bases: req.bases.filter((_, j) => j !== i),
+                  drones: req.drones.map((d) => (d.base_id === b.id ? { ...d, base_id: null } : d)),
+                })}>✕</button>
+              </span>
+            ))}
+            {req.reserve_sites.map((r, i) => (
+              <span className="chip reserve" key={`r${r.id}`}>
+                {r.id}
+                <button className="link" onClick={() => setReq({ ...req, reserve_sites: req.reserve_sites.filter((_, j) => j !== i) })}>✕</button>
+              </span>
+            ))}
+            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null); setFront(null) }}>
               очистить всё
             </button>
-          </p>
+          </div>
         </section>
 
         <section>
@@ -274,6 +326,18 @@ export default function App() {
           <button className="primary" disabled={!canRun} onClick={run}>
             {busy ? 'Расчёт…' : 'Рассчитать план'}
           </button>
+          <button className="secondary" disabled={!canRun || paretoBusy} onClick={runPareto}>
+            {paretoBusy ? 'Строим фронт Парето…' : 'Сравнить варианты (фронт Парето)'}
+          </button>
+          {front && front.length > 0 && (
+            <div className="pareto">
+              <p className="hint">
+                Каждая точка — недоминируемый план. Левее — быстрее, ниже — меньше суммарный налёт. Нажмите на точку, чтобы
+                открыть план.
+              </p>
+              <ParetoChart front={front} selected={plan?.plan_id ?? null} onSelect={setPlan} />
+            </div>
+          )}
           {error && <p className="error">{error}</p>}
         </section>
 
@@ -286,9 +350,11 @@ export default function App() {
               <div><b>{plan.summary.sorties}</b><span>вылетов</span></div>
               <div><b>{plan.summary.coverage_pct.toFixed(1)}%</b><span>покрытие {plan.summary.area_km2.toFixed(2)} км²</span></div>
             </div>
+            <h2>Вылеты во времени, мин</h2>
+            <Gantt plan={plan} colors={droneColor} />
             <table>
               <thead>
-                <tr><th /><th>Борт</th><th>Выс., м</th><th>Вылеты</th><th>Налёт</th><th>Финиш</th><th>Экспорт</th></tr>
+                <tr><th /><th>Борт</th><th>Выс., м</th><th>Вылеты</th><th>Налёт</th><th>Финиш</th><th>Уход*</th><th>Экспорт</th></tr>
               </thead>
               <tbody>
                 {plan.drones.map((d) => (
@@ -299,6 +365,7 @@ export default function App() {
                     <td>{d.sorties.length}</td>
                     <td>{min(d.flight_time_s)}</td>
                     <td>{min(d.finish_s)}</td>
+                    <td>{min(Math.max(...d.sorties.map((s) => s.max_divert_s)))}</td>
                     <td>
                       <a href={api.exportUrl(plan.plan_id, d.drone_id, 'geojson')}>GeoJSON</a>{' '}
                       <a href={api.exportUrl(plan.plan_id, d.drone_id, 'kml')}>KML</a>
@@ -307,6 +374,7 @@ export default function App() {
                 ))}
               </tbody>
             </table>
+            <p className="hint">* Уход — худшее время до ближайшей ВПП или резервной площадки с посадкой.</p>
             <a className="button" href={api.zipUrl(plan.plan_id)}>Скачать все задания (ZIP)</a>
             {plan.excluded.length > 0 && (
               <ul className="excluded">

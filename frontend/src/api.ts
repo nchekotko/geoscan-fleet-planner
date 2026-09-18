@@ -42,7 +42,7 @@ export interface PlanRequest {
 }
 
 export interface Leg {
-  kind: 'takeoff' | 'transit' | 'survey' | 'turn' | 'return' | 'landing'
+  kind: 'takeoff' | 'transit' | 'survey' | 'tie' | 'turn' | 'return' | 'landing'
   coordinates: number[][]
   duration_s: number
   distance_m: number
@@ -54,6 +54,8 @@ export interface Sortie {
   start_s: number
   duration_s: number
   survey_length_m: number
+  max_divert_s: number
+  divert_site: string
   legs: Leg[]
 }
 
@@ -144,6 +146,12 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
     }).then((r) => json<PlanResponse>(r)),
+  pareto: (req: PlanRequest) =>
+    fetch('/api/pareto', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    }).then((r) => json<PlanResponse[]>(r)),
   exportUrl: (planId: string, droneId: string, fmt: 'geojson' | 'kml') =>
     `/api/plan/${planId}/export/${encodeURIComponent(droneId)}.${fmt}`,
   zipUrl: (planId: string) => `/api/plan/${planId}/export.zip`,

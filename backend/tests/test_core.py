@@ -268,3 +268,21 @@ def test_divert_to_nearest_site_computed():
     for d in res.drones:
         for s in d.sorties:
             assert s.max_divert_s > 0 and s.divert_site
+
+
+def test_pareto_front_is_non_dominated():
+    from planner.pareto import pareto_front
+    front = pareto_front(load_req(), weights=(1.0, 0.5, 0.0), workers=1)
+    assert len(front) >= 2
+    for a, b in zip(front, front[1:]):
+        assert a.summary.makespan_s <= b.summary.makespan_s
+        assert a.summary.total_flight_s > b.summary.total_flight_s
+
+
+def test_api_pareto():
+    c = TestClient(app)
+    body = json.loads((SCENARIO.parent / "strong_wind.json").read_text(encoding="utf-8"))
+    r = c.post("/api/pareto", json=body)
+    assert r.status_code == 200, r.text
+    pts = r.json()
+    assert pts and all("plan_id" in p for p in pts)

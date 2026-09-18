@@ -82,6 +82,97 @@ button:disabled {
   opacity: 0.5;
   cursor: default;
 }
+button.secondary {
+  width: 100%;
+  margin-top: 6px;
+}
+.objects {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+  font-size: 12px;
+  align-items: center;
+}
+.chip {
+  background: #eef1f5;
+  border-radius: 10px;
+  padding: 1px 2px 1px 8px;
+}
+.chip.nfz {
+  background: #fde2e2;
+}
+.chip.reserve {
+  background: #fdebd8;
+}
+.chart {
+  display: block;
+  margin: 4px 0 10px;
+  font-size: 10px;
+}
+.chart .axis {
+  stroke: #999;
+}
+.chart .grid {
+  stroke: #eee;
+}
+.chart .tick {
+  fill: #555;
+  font-size: 10px;
+}
+.chart .label {
+  fill: #444;
+  font-size: 11px;
+}
+.chart .front {
+  fill: none;
+  stroke: #1d3557;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+}
+.chart .pt {
+  fill: #fff;
+  stroke: #1d3557;
+  stroke-width: 2;
+}
+.chart .pt.selected {
+  fill: #e63946;
+  stroke: #e63946;
+}
+.legend {
+  position: absolute;
+  right: 10px;
+  bottom: 24px;
+  z-index: 1000;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.legend i {
+  display: inline-block;
+  width: 26px;
+  height: 0;
+  vertical-align: middle;
+  margin-right: 6px;
+  border-top: 3px solid #555;
+}
+.legend .l-tie {
+  border-top-style: dashed;
+}
+.legend .l-turn {
+  border-top-width: 1px;
+}
+.legend .l-transit {
+  border-top: 2px dashed #555;
+}
+.legend .l-nfz {
+  height: 10px;
+  border: 2px solid #d62828;
+  background: rgba(214, 40, 40, 0.3);
+}
 button.link {
   border: none;
   background: none;

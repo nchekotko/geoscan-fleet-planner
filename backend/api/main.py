@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, Response
 
 from planner.export import drone_geojson, drone_kml, plan_zip
 from planner.fleet import load_fleet
+from planner.pareto import pareto_front
 from planner.planner import PlanningError, plan
 from planner.schemas import PlanRequest, PlanResponse
 
@@ -57,6 +58,23 @@ def make_plan(req: PlanRequest) -> dict:
     plan_id = uuid.uuid4().hex[:12]
     _plans[plan_id] = result
     return {"plan_id": plan_id, **result.model_dump()}
+
+
+@app.post("/api/pareto")
+def make_pareto(req: PlanRequest) -> list[dict]:
+    """Фронт Парето: недоминируемые планы по времени работ и суммарному налёту."""
+    try:
+        front = pareto_front(req)
+    except PlanningError as e:
+        raise HTTPException(422, str(e)) from e
+    if not front:
+        raise HTTPException(422, "не удалось построить ни одного плана")
+    out = []
+    for p in front:
+        plan_id = uuid.uuid4().hex[:12]
+        _plans[plan_id] = p
+        out.append({"plan_id": plan_id, **p.model_dump()})
+    return out
 
 
 def _get(plan_id: str) -> PlanResponse:

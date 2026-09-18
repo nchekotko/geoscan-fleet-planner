@@ -105,7 +105,9 @@ export default function MapView({ req, plan, drawMode, onDrawn, fitKey }: Props)
           const style: L.PolylineOptions =
             leg.kind === 'survey'
               ? { color, weight: 3 }
-              : leg.kind === 'turn'
+              : leg.kind === 'tie'
+                ? { color, weight: 3, dashArray: '10 4', opacity: 0.9 }
+                : leg.kind === 'turn'
                 ? { color, weight: 1.5, opacity: 0.7 }
                 : { color, weight: 2, dashArray: '6 6', opacity: 0.8 }
           L.polyline(latlngs, style)
@@ -129,5 +131,16 @@ export default function MapView({ req, plan, drawMode, onDrawn, fitKey }: Props)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fitKey])
 
-  return <div ref={el} className="map" />
+  return (
+    <>
+      <div ref={el} className="map" />
+      <div className="legend">
+        <div><i className="l-survey" /> галс съёмки</div>
+        <div><i className="l-tie" /> секущий маршрут</div>
+        <div><i className="l-turn" /> разворот</div>
+        <div><i className="l-transit" /> перелёт / возврат</div>
+        <div><i className="l-nfz" /> запретная зона</div>
+      </div>
+    </>
+  )
 }
