@@ -21,3 +21,4 @@ sources/*.txt
 pres/template.pptx
 pres/deck.md
 .claude/
+docs/review_*.md
