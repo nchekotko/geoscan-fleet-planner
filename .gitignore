@@ -14,3 +14,8 @@ pres/logos/
 pres/template.pptx
 pres/img/
 pres/unpacked/
+sources/*.pdf
+sources/*.txt
+*.pptx
+!pres/*.pptx
+pres/template.pptx

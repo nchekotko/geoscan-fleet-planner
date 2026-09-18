@@ -56,5 +56,5 @@ backend/
   tests/                 тесты (pytest)
 frontend/src/            React + TypeScript + Leaflet
 docs/                    документация
-sources/                 первоисточники ТТХ (PDF из ТЗ и руководство Геоскан 401)
+sources/download.sh      скачивание первоисточников ТТХ (PDF из ТЗ и руководство Геоскан 401)
 ```
