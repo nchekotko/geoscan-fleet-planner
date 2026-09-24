@@ -10,14 +10,17 @@
 ┌──────────────▼───────────────────────────────────────────────────┐
 │ FastAPI (api/main.py)                                           │
 │  /api/fleet  /api/scenarios  /api/plan  /api/pareto  /export    │
+│  /api/advise  /api/geodata  /api/import/kml                     │
 ├──────────────────────────────────────────────────────────────────┤
 │ Ядро planner/                                                   │
 │  fleet ─ sensors ─ wind ─ energy                                │
 │  coverage ─ dubins/turns ─ avoid ─ mission                      │
 │  partition / grid_partition ─ planner (оптимизация) ─ pareto    │
+│  geodata (зоны, препятствия) ─ advisor (подсказки)              │
 │  terrain (Copernicus DEM) ─ export (GeoJSON, KML)               │
 ├──────────────────────────────────────────────────────────────────┤
 │ Данные: data/fleet.yaml (ТТХ) · data/scenarios/*.json ·         │
+│         data/geodata/*.geojson (зоны, препятствия, задания) ·   │
 │         data/dem/*.tif (кэш рельефа)                            │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -37,6 +40,9 @@
 | `planner/partition.py`, `grid_partition.py` | Разбиение области между бортами: полосами и с учётом дальности |
 | `planner/planner.py` | Оркестрация, критерии, балансировка, локальный поиск, проверки |
 | `planner/pareto.py` | Фронт Парето (параллельно в процессах) |
+| `planner/geodata.py` | Разбор данных заказчика (KML): зоны ограничений с высотами и временем, высотные препятствия, задания на съёмку |
+| `planner/advisor.py` | Советник: кривая «время работ от числа бортов», ответы про срок и число бортов |
+| `data/geodata/*.geojson` | Выгрузки заказчика в нашем формате (341 зона, 5162 и 3201 препятствие, 696 участков задания) |
 | `planner/terrain.py` | Рельеф Copernicus DEM GLO-30 |
 | `planner/export.py` | GeoJSON и KML для каждого борта, ZIP со всеми заданиями |
 | `api/main.py` | HTTP API; раздача собранного интерфейса |

@@ -11,6 +11,10 @@
 | GET | `/api/scenarios/{name}` | Сценарий в формате запроса на планирование |
 | POST | `/api/plan` | Рассчитать план |
 | POST | `/api/pareto` | Рассчитать фронт Парето (набор недоминируемых планов) |
+| POST | `/api/advise` | Подсказки по ограничениям: выполнимо ли, сколько бортов нужно к сроку, сколько времени займут работы |
+| GET | `/api/geodata` | Выгрузки данных о воздушном пространстве (зоны, препятствия, задания) |
+| GET | `/api/geodata/{name}` | Выгрузка целиком (GeoJSON нашего формата) |
+| POST | `/api/import/kml` | Разбор KML заказчика: зоны ограничений, высотные препятствия, задание на съёмку |
 | GET | `/api/plan/{plan_id}/export/{drone_id}.geojson` | Полётное задание борта в GeoJSON |
 | GET | `/api/plan/{plan_id}/export/{drone_id}.kml` | Полётное задание борта в KML 2.2 |
 | GET | `/api/plan/{plan_id}/export.zip` | Все задания плана (GeoJSON + KML) и сводка |
@@ -34,7 +38,13 @@
   "time_weight": 1.0,
   "reserve": 0.2,
   "nfz_buffer_m": 30,
-  "use_terrain": true
+  "use_terrain": true,
+  "restrictions": [],
+  "obstacles": [],
+  "obstacle_clearance_m": 30,
+  "obstacle_buffer_m": 50,
+  "mission_start": "2026-09-29T06:00:00+03:00",
+  "mission_window_h": 12
 }
 ```
 
@@ -55,6 +65,13 @@
 | `reserve` | Резерв заряда, доля (0,2 = 20 %) |
 | `nfz_buffer_m` | Запас вокруг запретных зон, м |
 | `use_terrain` | Учитывать рельеф Copernicus DEM |
+| `restrictions` | Зоны ограничений с диапазоном высот и временем действия (Feature нашего формата, см. [data_formats.md](data_formats.md)). Мешает только зона, чья полоса высот пересекает высоты работ и которая действует в окно работ |
+| `obstacles` | Высотные препятствия (мачты, трубы, ЛЭП, лес) с верхней отметкой. Препятствие выше высоты съёмки с зазором становится запретной зоной, остальные не мешают |
+| `obstacle_clearance_m` | Вертикальный зазор над препятствием, м (по умолчанию 30) |
+| `obstacle_buffer_m` | Горизонтальный обход препятствия, м (по умолчанию 50) |
+| `mission_start` | Начало работ, ISO 8601 — по нему отбираются временные зоны |
+| `mission_window_h` | Окно работ, ч (по умолчанию 12): зона учитывается, если действует хотя бы в один его момент |
+| `drones[].flights_done`, `drones[].hours_done` | Наработка борта с прошлого ТО (нормативы: 201 и 401 — 80 полётов, 801 и Gemini — 160 часов) |
 
 ## Ответ
 
@@ -74,14 +91,23 @@
       "legs": [{"kind": "survey", "coordinates": [[37.61, 55.60, 233], [37.61, 55.62, 233]],
                 "alt_amsl": [430.1, 430.1], "duration_s": 118, "distance_m": 2200, "speed_ms": 19.4}]
     }],
-    "flight_time_s": 3400, "finish_s": 3400, "transit_alt_agl_m": 253
+    "flight_time_s": 3400, "finish_s": 3400, "transit_alt_agl_m": 253,
+    "maintenance": {"interval_flights": 80, "flights_before": 0, "flights_after": 2,
+                    "remaining_flights": 78, "due": false}
   }],
   "excluded": [{"drone_id": "801-1", "reason": "Геоскан 801: ветер 11 м/с выше допустимого 10 м/с"}],
   "warnings": [],
   "working_area": {"type": "Polygon", "coordinates": []},
   "no_fly_zones": [{"type": "Polygon", "coordinates": []}],
   "allowed_area": null,
-  "terrain": {"source": "Copernicus DEM GLO-30 (DSM, EGM2008)", "ground_min_m": 151.7, "ground_max_m": 196.7}
+  "terrain": {"source": "Copernicus DEM GLO-30 (DSM, EGM2008)", "ground_min_m": 151.7, "ground_max_m": 196.7},
+  "restrictions": [{"type": "Feature", "geometry": {}, "properties": {"id": "UUR201", "zone_type": "temporary",
+      "alt": {"lower_m": 800, "lower_ref": "AMSL", "upper_m": 2743.2, "upper_ref": "AMSL", "raw": "От 800 м (2700 фут) AMSL до FL90"},
+      "applies": false, "skip_reason": "полоса высот 637–2643 м над землёй выше работ (до 210 м)"}}],
+  "obstacles": [{"type": "Feature", "geometry": {}, "properties": {"id": "UUWV100069",
+      "obstacle_type": "COMMUNICATION_TOWER", "top_m": 200.1, "top_ref": "AGL", "top_agl_m": 200.1, "blocks": true}}],
+  "airspace": {"restrictions_total": 2, "restrictions_applied": 0, "obstacles_total": 27, "obstacles_blocking": 2,
+               "alt_band_agl_m": [150.0, 210.0], "ground_min_m": 100.0, "ground_max_m": 163.5}
 }
 ```
 
@@ -91,6 +117,34 @@
 `no_fly_zones` и `allowed_area` повторяют ограничения из запроса — они попадают в экспорт заданий.
 Разведение бортов: `summary.min_separation_m` — наименьшее горизонтальное расстояние между бортами на близких высотах (разница < 15 м) вне окрестности ВПП, `separation_pair` — какие борта, `separation_conflicts` — число моментов (шаг 5 с) со сближением меньше 50 м; `null`, если борта ни разу не оказываются на одной высоте. `drones[].transit_alt_agl_m` — эшелон перелёта борта (к области и обратно), `sorties[].start_s` учитывает очередь стартов на ВПП.
 Взлёт и посадка Геоскан 201 при ветре: `takeoff` — две точки (ВПП на земле → конец разгона против ветра), `landing` — три (начало захода на эшелоне → раскрытие парашюта на 100 м с наветренной стороны → ВПП на земле).
+
+Воздушное пространство: `airspace` — сколько зон и препятствий пришло и сколько вошло в расчёт, полоса высот работ над землёй (`alt_band_agl_m`) и высоты земли по области. В `restrictions` возвращаются все зоны из коридора работ с полем `applies`; у пропущенных — `skip_reason` («полоса высот выше работ», «не действует в окно работ»). В `obstacles` — только мешающие, с верхом над землёй `top_agl_m`.
+Техобслуживание: `drones[].maintenance` — сколько полётов или часов израсходует борт и сколько останется до ТО; `due: true` — ресурс кончится в этом задании (в `warnings` появится строка).
+
+## Советник
+
+`POST /api/advise` — тело запроса такое же, как у `/api/plan`, плюс `deadline_s` (срок работ, с) и `max_drones` (сколько бортов разрешено занять). Считается кривая «время работ от числа бортов»: планы для 1, 2, … N бортов (борта добавляются по убыванию полезной производительности) считаются параллельно.
+
+```json
+{
+  "options": [{"drones": 1, "drone_ids": ["201-1"], "makespan_s": 4986, "total_flight_s": 4986,
+               "sorties": 2, "coverage_pct": 95.7, "best_makespan_s": null, "feasible": false,
+               "reason": "область снята на 95.7 % — этому набору бортов её целиком не покрыть"},
+              {"drones": 3, "drone_ids": ["gemini-1", "gemini-2", "201-1"], "makespan_s": 3714,
+               "total_flight_s": 9630, "sorties": 6, "coverage_pct": 100.0, "best_makespan_s": 3714, "feasible": true}],
+  "deadline_s": 4200, "feasible": true, "drones_needed": 3,
+  "drones_needed_ids": ["gemini-1", "gemini-2", "201-1"],
+  "best_makespan_s": 3486, "best_drones": 4, "min_total_flight_s": 4986,
+  "message": "Уложиться в срок 1 ч 10 мин можно: нужно 3 борта (gemini-1, gemini-2, 201-1), работы займут 1 ч 02 мин."
+}
+```
+
+Набор бортов, который не снимает область целиком (например, один самолёт не достаёт до полос у запретных зон), срок не выполняет: у такого варианта `feasible: false` и причина в `reason`. Одновременно считается только один запрос к советнику или фронту Парето — иначе `503`.
+
+## Данные о воздушном пространстве
+
+`GET /api/geodata` → `[{"name": "zones_moscow", "title": "Московская зона.kml", "features": 341, "size_kb": 353}]`,
+`GET /api/geodata/{name}` отдаёт выгрузку целиком. `POST /api/import/kml` с телом `{"kml": "<содержимое файла>", "kind": "auto"}` разбирает KML заказчика и возвращает `{"kind": "zones|obstacles|task", "features": [...]}`. Формат описан в [data_formats.md](data_formats.md).
 
 Ошибки: `422` — план невозможен (пустая рабочая область, нет подходящих бортов), текст причины в `detail`; `404` — план не найден (планы хранятся в памяти процесса до перезапуска).
 
