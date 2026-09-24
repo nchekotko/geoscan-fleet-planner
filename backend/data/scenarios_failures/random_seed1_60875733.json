@@ -1,0 +1,141 @@
+{
+ "_comment": "случайный сценарий seed=60875733: невыпуклая область 11.7 км², NFZ 2, баз 2, бортов 6 | находки бенчмарка: исключение в плане w1: GEOSException: TopologyException: side location conflict at 322.59304636426282 281.70518108568587. This can occur if the input geometry is invalid. [set_operations.py:168]; исключение в плане w0: GEOSException: TopologyException: side location conflict at 322.59304636426282 281.70518108568587. This can occur if the input geometry is invalid. [set_operations.py:168]",
+ "survey_area": {
+  "type": "Polygon",
+  "coordinates": [
+   [
+    [
+     37.505772,
+     55.830241
+    ],
+    [
+     37.487534,
+     55.814808
+    ],
+    [
+     37.56079,
+     55.810671
+    ],
+    [
+     37.572045,
+     55.827809
+    ],
+    [
+     37.553123,
+     55.843281
+    ],
+    [
+     37.505772,
+     55.830241
+    ]
+   ]
+  ]
+ },
+ "no_fly_zones": [
+  {
+   "type": "Polygon",
+   "coordinates": [
+    [
+     [
+      37.538316,
+      55.82825
+     ],
+     [
+      37.549428,
+      55.834085
+     ],
+     [
+      37.542852,
+      55.838036
+     ],
+     [
+      37.53174,
+      55.832201
+     ],
+     [
+      37.538316,
+      55.82825
+     ]
+    ]
+   ]
+  },
+  {
+   "type": "Polygon",
+   "coordinates": [
+    [
+     [
+      37.514419,
+      55.814669
+     ],
+     [
+      37.516694,
+      55.817367
+     ],
+     [
+      37.508476,
+      55.819553
+     ],
+     [
+      37.506201,
+      55.816854
+     ],
+     [
+      37.514419,
+      55.814669
+     ]
+    ]
+   ]
+  }
+ ],
+ "bases": [
+  {
+   "id": "A",
+   "lon": 37.547837,
+   "lat": 55.80554
+  },
+  {
+   "id": "B",
+   "lon": 37.527654,
+   "lat": 55.844328
+  }
+ ],
+ "drones": [
+  {
+   "id": "gemini-1",
+   "model": "geoscan_gemini",
+   "base_id": "A"
+  },
+  {
+   "id": "801-2",
+   "model": "geoscan_801"
+  },
+  {
+   "id": "201-3",
+   "model": "geoscan_201",
+   "base_id": "B"
+  },
+  {
+   "id": "801-4",
+   "model": "geoscan_801",
+   "base_id": "B"
+  },
+  {
+   "id": "201-5",
+   "model": "geoscan_201"
+  },
+  {
+   "id": "401-6",
+   "model": "geoscan_401"
+  }
+ ],
+ "survey_type": "rgb",
+ "requirements": {
+  "gsd_cm": 5.0
+ },
+ "wind": {
+  "speed_ms": 3.5,
+  "from_deg": 26
+ },
+ "time_weight": 1.0,
+ "use_terrain": false
+}

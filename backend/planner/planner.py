@@ -360,12 +360,23 @@ class Planner:
                     continue
                 working = [k for k in able if k < n_active or not regions[k].is_empty]
                 able = working or able
-                j = min(able, key=lambda k: regions[k].distance(piece) if not regions[k].is_empty
-                        else self._far_point(piece, cands[k]))
+                j = min(able, key=lambda k: self._gap_cost(cands[k], regions[k], piece))
                 regions[j] = _polys(unary_union([regions[j], piece]))
         return regions, leftover
 
+    def _gap_cost(self, cand: Candidate, region: BaseGeometry, piece: BaseGeometry) -> float:
+        """Оценка времени, к которому мультиротор закончит, если кусок у NFZ отдать ему:
+        своя работа плюс съёмка куска плюс перелёты к нему. Без оценки загрузки кольца
+        у NFZ уходили ближайшему борту, и один борт с далёкой базой затягивал все работы."""
+        speed = max(cand.params.speed_ms, 1.0)
+        prod = max(cand.productivity, 1e-6)
+        # перелёты: туда-обратно до дальней точки куска, по числу вылетов на него
+        trips = max(math.ceil(piece.area / prod / max(cand.budget_s, 1.0)), 1)
+        transit = 2 * trips * self._far_point(piece, cand) / speed
+        return (region.area + piece.area) / prod + transit
+
     def _far_point(self, geom: BaseGeometry, cand: Candidate) -> float:
+        """Расстояние от базы борта до самой дальней точки геометрии."""
         b = self.bases[cand.base_id or self._default_base(self.area)]
         return max(
             (math.dist(b, c) for g in getattr(geom, "geoms", [geom]) for c in g.exterior.coords),
@@ -411,14 +422,7 @@ class Planner:
         results: list[DroneResult] = []
         work = [(cand, region) for k, (cand, region) in enumerate(zip(workers, regions))
                 if not (k >= len(active) and region.is_empty)]
-        # очередь стартов на каждой ВПП: самолёты первыми (у них самые длинные вылеты),
-        # порядок результатов при этом не меняется — балансировка сопоставляет его с долями
-        launch: dict[str, float] = {}
-        next_launch: dict[str, float] = {}
-        for cand, region in sorted(work, key=lambda cr: cr[0].drone.type != "fixed_wing"):
-            b = cand.base_id or self._default_base(region)
-            launch[cand.instance_id] = next_launch.get(b, 0.0)
-            next_launch[b] = launch[cand.instance_id] + LAUNCH_INTERVAL_S[cand.drone.type]
+        built: list[tuple[Candidate, BaseGeometry, str, list, float]] = []
         for cand, region in work:
             base_id = cand.base_id or self._default_base(region)
             base = self.bases[base_id]
@@ -431,6 +435,21 @@ class Planner:
                 route += order_passes(ties, route[-1].b if route else base, kind="tie")
             builder = SortieBuilder(cand.drone, p.speed_ms, p.altitude_agl_m, cand.wind or self.req.wind, cand.budget_s, self.router)
             sorties = builder.build(route, base, base_id)
+            # длительность работы борта без ожидания очереди на старт
+            built.append((cand, region, base_id, sorties, schedule(sorties, cand.drone.swap_time_min * 60)))
+        # Очередь стартов на каждой ВПП. Борт занимает полосу на LAUNCH_INTERVAL_S, а дальше
+        # работает сам: это задача 1||Lmax, где «хвост» работы q = длительность − интервал.
+        # Её оптимально решает правило Джексона — первым стартует борт с самым длинным хвостом
+        # (Jackson, 1955). Порядок результатов при этом не меняется: балансировка сопоставляет
+        # его с долями.
+        launch: dict[str, float] = {}
+        next_launch: dict[str, float] = {}
+        for cand, _, base_id, _, dur in sorted(
+            built, key=lambda b: -(b[4] - LAUNCH_INTERVAL_S[b[0].drone.type])
+        ):
+            launch[cand.instance_id] = next_launch.get(base_id, 0.0)
+            next_launch[base_id] = launch[cand.instance_id] + LAUNCH_INTERVAL_S[cand.drone.type]
+        for cand, region, base_id, sorties, _ in built:
             finish = schedule(sorties, cand.drone.swap_time_min * 60, launch[cand.instance_id])
             results.append(DroneResult(cand, region, base_id, sorties, finish))
         return Evaluation(fractions=list(fractions), results=results, leftover_m2=leftover, unreachable_m2=unreachable)
@@ -746,13 +765,14 @@ class Planner:
             return score(a) < score(b) - 1e-6
 
         best = start
-        if lexi:
-            # один борт на всю область по T_max заведомо хуже — вместо этого пробуем убрать борт
-            e = None if quick else self._drop_overhead_drone(cands, best, angle, better)
+        if lexi and not quick:
+            # ход «убрать борт»: борт, который в основном летает к области и обратно
+            e = self._drop_overhead_drone(cands, best, angle, better)
             if e is not None and better(e, best):
                 best = e
-        else:
-            # дополнительные стартовые точки: вся работа одному борту
+        if not quick:
+            # дополнительные стартовые точки: вся работа одному борту. И при w = 1 это бывает
+            # быстрее: у остальных далёкая база или ждать очереди на старт дольше, чем снимать
             for i in range(len(cands)):
                 fr = [1.0 if k == i else 0.0 for k in range(len(cands))]
                 try:
@@ -798,33 +818,46 @@ class Planner:
         return best
 
     def _drop_overhead_drone(self, cands: list[Candidate], cur: Evaluation, angle: float, better) -> Evaluation | None:
-        """Ход «убрать борт»: если время борта в основном уходит на накладные расходы
-        (взлёт, набор высоты, перелёт, посадка), а не на съёмку, его участок отдаём остальным
-        и заново балансируем доли. Возвращает лучший из таких планов или None."""
+        """Ход «убрать борт» — жадное исключение: пока план улучшается, пробуем убрать любой
+        работающий борт (его участок уходит остальным, доли заново балансируются) и берём лучший
+        вариант. Лишний борт удлиняет работу: ждёт очереди на старт с общей ВПП, летит к далёкому
+        участку, с малой долей тратит время на взлёт и посадку. Первыми пробуем борта, у которых
+        съёмка — меньшая часть времени. Возвращает лучший найденный план или None."""
         survey_kinds = ("survey", "tie")
-        by_id = {r.cand.instance_id: r for r in cur.results}
-        best = None
-        for i, c in enumerate(cands):
-            r = by_id.get(c.instance_id)
-            if r is None or len(cur.results) < 2:
-                continue
-            survey_s = sum(l.duration_s for s in r.sorties for l in s.legs if l.kind in survey_kinds)
-            if survey_s >= 0.5 * r.finish_s:
-                continue
-            keep = [k for k in range(len(cands)) if k != i and cur.fractions[k] > 1e-6]
-            sub = [cands[k] for k in keep]
-            try:
-                e = self._balance_from(sub, [cur.fractions[k] for k in keep], angle, 2 if self.mode == "grid" else 6)
-            except (ValueError, GEOSException):
-                continue
-            if e.unreachable_m2 > cur.unreachable_m2 + 1.0 or e.leftover_m2 > cur.leftover_m2 + 1.0:
-                continue
-            full = [0.0] * len(cands)
-            for k, f in zip(keep, e.fractions):
-                full[k] = f
-            e.fractions = full
-            if best is None or better(e, best):
-                best = e
+        iters = 2 if self.mode == "grid" else 6
+        best: Evaluation | None = None
+        base = cur
+        for _ in range(max(len(cands) - 1, 0)):
+            if len(base.results) < 2:
+                break
+            by_id = {r.cand.instance_id: r for r in base.results}
+
+            def share(i: int) -> float:
+                r = by_id.get(cands[i].instance_id)
+                if r is None or r.finish_s <= 0:
+                    return 1.0
+                return sum(l.duration_s for s in r.sorties for l in s.legs if l.kind in survey_kinds) / r.finish_s
+
+            active = [i for i in range(len(cands)) if base.fractions[i] > 1e-6]
+            round_best: Evaluation | None = None
+            for i in sorted(active, key=share):
+                keep = [k for k in active if k != i]
+                sub = [cands[k] for k in keep]
+                try:
+                    e = self._balance_from(sub, [base.fractions[k] for k in keep], angle, iters)
+                except (ValueError, GEOSException):
+                    continue
+                if e.unreachable_m2 > cur.unreachable_m2 + 1.0 or e.leftover_m2 > cur.leftover_m2 + 1.0:
+                    continue
+                full = [0.0] * len(cands)
+                for k, f in zip(keep, e.fractions):
+                    full[k] = f
+                e.fractions = full
+                if round_best is None or better(e, round_best):
+                    round_best = e
+            if round_best is None or not better(round_best, base):
+                break
+            best = base = round_best
         return best
 
     # ------------------------------------------------------------ вывод
