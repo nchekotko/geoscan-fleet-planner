@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 
 from shapely import affinity
-from shapely.geometry import LineString, MultiPolygon, Polygon
+from shapely.geometry import LineString, MultiPolygon, Polygon, box
 from shapely.geometry.base import BaseGeometry
 
 from .fleet import DroneModel
@@ -41,11 +41,24 @@ class Pass:
 
 
 def sweep_passes(
-    area: Polygon | MultiPolygon, angle: float, spacing: float, min_len: float = 1.0
+    area: Polygon | MultiPolygon, angle: float, spacing: float, min_len: float = 1.0,
+    swath: float = 0.0, free: BaseGeometry | None = None, need: BaseGeometry | None = None,
 ) -> list[Pass]:
     """Галсы под углом angle (рад, 0 = восток) с шагом spacing. Первая линия — на spacing/2
-    от края, чтобы полоса съёмки покрывала границу."""
+    от края, чтобы полоса съёмки покрывала границу.
+
+    swath > 0 — «добор кромок»: галс продлевается за край участка настолько, чтобы полоса
+    захвата накрыла всё, что попадает в её ширину. У наклонной кромки галс обрывается раньше
+    соседнего, и между ними остаётся неснятый клин — на LiDAR-сценарии такие клинья давали
+    0,8 % площади. Продление ограничено областью free (там, где летать можно), а need задаёт,
+    ради чего продлевать: без неё — ради всего участка, с ней — только ради неснятых кусков
+    (иначе на участках с рваной границей галсы удлиняются всюду, а покрытие почти не растёт).
+    """
     rot = affinity.rotate(area, -angle, origin=(0, 0), use_radians=True)
+    free_rot = (affinity.rotate(free, -angle, origin=(0, 0), use_radians=True)
+                if (swath > 0 and free is not None) else None)
+    need_rot = (affinity.rotate(need, -angle, origin=(0, 0), use_radians=True)
+                if (swath > 0 and need is not None) else None)
     minx, miny, maxx, maxy = rot.bounds
     passes: list[Pass] = []
     n_lines = max(1, math.ceil((maxy - miny) / spacing))
@@ -56,12 +69,42 @@ def sweep_passes(
         cut = LineString([(minx - 1, y), (maxx + 1, y)]).intersection(rot)
         segs = _lines_of(cut)
         segs.sort(key=lambda s: min(s.coords[0][0], s.coords[-1][0]))
+        band = (box(minx - 1, y - swath / 2, maxx + 1, y + swath / 2)
+                .intersection(rot if need_rot is None else need_rot)) if swath > 0 else None
         for j, s in enumerate(s for s in segs if s.length >= min_len):
             x1, x2 = sorted((s.coords[0][0], s.coords[-1][0]))
+            if band is not None and not band.is_empty:
+                x1 -= _room(band, free_rot, y, swath, x1, back=True)
+                x2 += _room(band, free_rot, y, swath, x2, back=False)
             back = affinity.rotate(LineString([(x1, y), (x2, y)]), angle, origin=(0, 0), use_radians=True)
             c = list(back.coords)
             passes.append(Pass(line=i, seq=j, a=c[0], b=c[1], lo=x1, hi=x2))
     return passes
+
+
+def _room(band: BaseGeometry, free_rot: BaseGeometry | None, y: float, swath: float,
+          x: float, back: bool) -> float:
+    """На сколько продлить галс за точку x, чтобы полоса захвата накрыла участок в пределах
+    своей ширины. Дальше половины ширины полосы не продлеваем и из области полёта не выходим."""
+    cap = swath / 2
+    lo, hi = (x - cap, x) if back else (x, x + cap)
+    part = band.intersection(box(lo, y - swath / 2, hi, y + swath / 2))
+    if part.is_empty:
+        return 0.0
+    need = (x - part.bounds[0]) if back else (part.bounds[2] - x)
+    if need <= 0.5:
+        return 0.0
+    if free_rot is not None:
+        # не выходим за пределы разрешённого объёма и не заходим в запретные зоны
+        seg = LineString([(x - need, y), (x, y)] if back else [(x, y), (x + need, y)])
+        allowed = seg.intersection(free_rot)
+        room = 0.0
+        for part_line in _lines_of(allowed):
+            a, b = sorted((part_line.coords[0][0], part_line.coords[-1][0]))
+            if (back and b >= x - 1e-6) or (not back and a <= x + 1e-6):
+                room = max(room, (x - a) if back else (b - x))
+        need = min(need, room)
+    return max(need, 0.0)
 
 
 def _lines_of(g: BaseGeometry) -> list[LineString]:

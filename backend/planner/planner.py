@@ -218,6 +218,11 @@ class Planner:
         if self.area.is_empty or self.area.area < 100:
             raise PlanningError("рабочая область пуста после вычета запретных зон")
         self.mode = "strips"
+        # добор кромок галсами включается только для финального плана (в оптимизации дорого)
+        self.edge_fill = False
+        self._missing: BaseGeometry | None = None
+        self._free: BaseGeometry | None = None
+        self._cands: list[Candidate] = []
         self.router = Router(self.nfz, req.nfz_buffer_m, self.allowed)
         self.bases = {b.id: f.lonlat_to_xy(b.lon, b.lat) for b in req.bases}
         self.reserve_sites = {}
@@ -558,6 +563,66 @@ class Planner:
         transit = 2 * trips * self._far_point(piece, cand) / speed
         return (region.area + piece.area) / prod + transit
 
+    def _free_space(self) -> BaseGeometry:
+        """Где вообще можно летать: разрешённый объём (или окрестность области) без запретных зон."""
+        if self._free is None:
+            base = self.allowed if self.allowed is not None else self.area.buffer(5_000.0)
+            if self.nfz:
+                base = base.difference(unary_union([z.buffer(self.req.nfz_buffer_m) for z in self.nfz]))
+            self._free = _polys(base)
+        return self._free
+
+    def _free_for(self, cand: Candidate) -> BaseGeometry:
+        """То же для конкретного борта: самолёту нужен ещё запас на вынос разворота."""
+        free = self._free_space()
+        return self._turn_room(free, cand) if cand.drone.type == "fixed_wing" else free
+
+    def _fill_edges(self, ev: Evaluation, angle: float) -> Evaluation:
+        """Добор кромок: галсы продлеваются за край участка так, чтобы полоса захвата накрыла
+        кромку (у наклонных границ соседние галсы обрываются на разной длине, и между ними
+        остаётся неснятый клин). Продлеваем только ради реально неснятых кусков и только один
+        раз — для финального плана; результат принимается, если покрытие выросло."""
+        if not self._cands or len(self._cands) != len(ev.fractions):
+            return ev
+        missing = self._uncovered(ev.results)
+        if missing.is_empty or missing.area < UNCOVERED_TOL_M2:
+            return ev
+        self.edge_fill = True
+        self._missing = missing
+        try:
+            ev2 = self.evaluate(self._cands, ev.fractions, angle)
+        except (ValueError, GEOSException):
+            return ev
+        finally:
+            self.edge_fill = False
+            self._missing = None
+        if self._coverage(ev2.results) > self._coverage(ev.results) + UNCOVERED_TOL_M2:
+            return ev2
+        return ev
+
+    def _covered(self, results: list[DroneResult]) -> BaseGeometry:
+        """Геометрия снятой площади: объединение полос захвата вдоль галсов."""
+        strips = []
+        for r in results:
+            half = r.cand.params.swath_m / 2
+            for s in r.sorties:
+                for leg in s.legs:
+                    if leg.kind in ("survey", "tie") and leg.distance_m > 0:
+                        strips.append(LineString(leg.points).buffer(half, cap_style="flat"))
+        if not strips:
+            return Polygon()
+        try:
+            return unary_union(strips)
+        except GEOSException:
+            return shapely.union_all(strips, grid_size=0.05)
+
+    def _uncovered(self, results: list[DroneResult]) -> BaseGeometry:
+        """Что осталось неснятым в рабочей области."""
+        try:
+            return _polys(self.area.difference(self._covered(results)))
+        except GEOSException:
+            return Polygon()
+
     def _far_point(self, geom: BaseGeometry, cand: Candidate) -> float:
         """Расстояние от базы борта до самой дальней точки геометрии."""
         b = self.bases[cand.base_id or self._default_base(self.area)]
@@ -606,11 +671,23 @@ class Planner:
         work = [(cand, region) for k, (cand, region) in enumerate(zip(workers, regions))
                 if not (k >= len(active) and region.is_empty)]
         built: list[tuple[Candidate, BaseGeometry, str, list, float]] = []
-        for cand, region in work:
+        # добор кромок продлевает галсы за край участка, но только наружу общей области:
+        # в участок соседа лезть незачем — он его и так снимает
+        others = ([unary_union([r for k, (_, r) in enumerate(work) if k != i and not r.is_empty])
+                   for i in range(len(work))] if self.edge_fill and len(work) > 1 else None)
+        for i, (cand, region) in enumerate(work):
             base_id = cand.base_id or self._default_base(region)
             base = self.bases[base_id]
             p = cand.params
-            passes = sweep_passes(region, angle, p.line_spacing_m) if not region.is_empty else []
+            free = None
+            if self.edge_fill:
+                free = self._free_for(cand)
+                if others is not None:
+                    free = free.difference(others[i])
+            passes = (sweep_passes(region, angle, p.line_spacing_m,
+                                   swath=p.swath_m if self.edge_fill else 0.0, free=free,
+                                   need=self._missing if self.edge_fill else None)
+                      if not region.is_empty else [])
             route = order_passes(passes, base)
             if p.tie_line_spacing_m and not region.is_empty:
                 # секущие маршруты поперёк основных галсов (геофизика)
@@ -789,6 +866,7 @@ class Planner:
             # В сеточном режиме участки растут от баз и от порядка не зависят, а одна оценка
             # стоит ~0,3 с; на large_mixed_fleet доводка ничего не дала — там её не делаем.
             cands, best = self._order_search(cands, best, angle)
+        self._cands = cands
         return best
 
     def prepare(self) -> tuple[list[Candidate], float]:
@@ -1082,20 +1160,14 @@ class Planner:
                         break
 
     def _coverage(self, results: list[DroneResult]) -> float:
-        strips = []
-        for r in results:
-            half = r.cand.params.swath_m / 2
-            for s in r.sorties:
-                for leg in s.legs:
-                    if leg.kind in ("survey", "tie") and leg.distance_m > 0:
-                        strips.append(LineString(leg.points).buffer(half, cap_style="flat"))
-        if not strips:
+        covered = self._covered(results)
+        if covered.is_empty:
             return 0.0
         try:
-            return unary_union(strips).intersection(self.area).area
+            return covered.intersection(self.area).area
         except GEOSException:
             # численная неустойчивость GEOS на почти совпадающих рёбрах — считаем на сетке 5 см
-            return shapely.intersection(shapely.union_all(strips, grid_size=0.05), self.area, grid_size=0.05).area
+            return shapely.intersection(covered, self.area, grid_size=0.05).area
 
     # ------------------------------------------------------------ рельеф
     def _terrain(self) -> Terrain | None:
@@ -1197,6 +1269,7 @@ class Planner:
 
     def run(self) -> PlanResponse:
         ev, angle = self.solve()
+        ev = self._fill_edges(ev, angle)
         f = self.frame
         terrain = self._terrain()
         drones_out: list[DronePlanOut] = []
