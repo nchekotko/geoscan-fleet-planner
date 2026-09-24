@@ -1,4 +1,4 @@
-import type { PlanResponse } from './api'
+import type { AdviceOption, PlanResponse } from './api'
 import { formatCoverage, isEpsilonPlan } from './logic'
 
 const fmtMin = (s: number) => `${Math.round(s / 60)}`
@@ -107,6 +107,72 @@ export function Gantt({ plan, colors }: { plan: PlanResponse; colors: Record<str
               <title>{`${d.drone_id}, вылет ${s.index + 1}: ${fmtMin(s.start_s)}–${fmtMin(s.start_s + s.duration_s)} мин, база ${s.base_id}`}</title>
             </rect>
           ))}
+        </g>
+      ))}
+    </svg>
+  )
+}
+
+/** Кривая советника: число бортов (x) против времени работ (y). Пунктир — заданный срок;
+ *  полые точки — наборы бортов, которые не покрывают область целиком. */
+export function AdviceChart({ options, deadlineS }: { options: AdviceOption[]; deadlineS: number | null }) {
+  const pts = options.filter((o) => o.makespan_s != null)
+  if (pts.length < 1) return null
+  const W = 360
+  const H = 200
+  const P = { l: 44, r: 12, t: 12, b: 34 }
+  const xs = pts.map((o) => o.drones)
+  const ys = pts.map((o) => o.makespan_s as number)
+  if (deadlineS) ys.push(deadlineS)
+  const x0 = Math.min(...xs) - 0.5
+  const x1 = Math.max(...xs) + 0.5
+  const y0 = 0
+  const y1 = Math.max(...ys) * 1.1 || 1
+  const sx = (v: number) => P.l + ((v - x0) / (x1 - x0)) * (W - P.l - P.r)
+  const sy = (v: number) => H - P.b - ((v - y0) / (y1 - y0)) * (H - P.t - P.b)
+  const line = pts.filter((o) => !o.reason)
+  return (
+    <svg width={W} height={H} className="chart" role="img" aria-label="Время работ от числа бортов">
+      <line x1={P.l} y1={H - P.b} x2={W - P.r} y2={H - P.b} className="axis" />
+      <line x1={P.l} y1={P.t} x2={P.l} y2={H - P.b} className="axis" />
+      {[y0, y1 / 2, y1].map((v) => (
+        <text key={`y${v}`} x={P.l - 6} y={sy(v) + 4} textAnchor="end" className="tick">
+          {fmtMin(v)}
+        </text>
+      ))}
+      {pts.map((o, i) => (
+        <text key={i} x={sx(o.drones)} y={H - P.b + 14} textAnchor="middle" className="tick">
+          {o.drones}
+        </text>
+      ))}
+      <text x={(W + P.l) / 2} y={H - 4} textAnchor="middle" className="label">
+        число бортов
+      </text>
+      <text x={12} y={(H - P.b) / 2} textAnchor="middle" className="label" transform={`rotate(-90 12 ${(H - P.b) / 2})`}>
+        время работ, мин
+      </text>
+      {deadlineS != null && (
+        <g>
+          <line x1={P.l} y1={sy(deadlineS)} x2={W - P.r} y2={sy(deadlineS)} className="deadline" />
+          <text x={P.l + 4} y={sy(deadlineS) - 4} textAnchor="start" className="tick deadline-label">
+            срок {fmtMin(deadlineS)} мин
+          </text>
+        </g>
+      )}
+      {line.length > 1 && (
+        <polyline points={line.map((o) => `${sx(o.drones)},${sy(o.makespan_s as number)}`).join(' ')} className="front" />
+      )}
+      {pts.map((o, i) => (
+        <g key={i}>
+          <circle
+            cx={sx(o.drones)}
+            cy={sy(o.makespan_s as number)}
+            r={5}
+            className={o.reason ? 'pt bad' : o.feasible ? 'pt selected' : 'pt'}
+          />
+          <title>
+            {`${o.drones} борт(ов) (${o.drone_ids.join(', ')}): работы ${fmtMin(o.makespan_s ?? 0)} мин, налёт ${fmtMin(o.total_flight_s ?? 0)} мин, покрытие ${formatCoverage(o.coverage_pct ?? 0)} %${o.reason ? ` — ${o.reason}` : ''}`}
+          </title>
         </g>
       ))}
     </svg>

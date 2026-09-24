@@ -1,29 +1,52 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import './App.css'
 import MapView, { DRONE_COLORS, type DrawMode, type FitRequest } from './MapView'
-import ImportChooser from './ImportChooser'
-import { api, ApiError, type Fleet, type PlanRequest, type PlanResponse, type SurveyType } from './api'
-import { Gantt, ParetoChart } from './charts'
+import ImportChooser, { AirspaceChooser } from './ImportChooser'
 import {
+  api,
+  ApiError,
+  type AdviceResponse,
+  type Fleet,
+  type GeodataSet,
+  type KmlImport,
+  type PlanRequest,
+  type PlanResponse,
+  type SurveyType,
+} from './api'
+import { AdviceChart, Gantt, ParetoChart } from './charts'
+import {
+  airspaceEmpty,
+  airspaceSummary,
+  applyAirspace,
   applyEdit,
   applyImport,
+  areaFromFeatures,
   bboxOf,
   COVERAGE_OK_PCT,
   criterionLabel,
+  datetimeLocalValue,
   droneIdErrors,
   EMPTY_REQUEST as EMPTY,
+  filterAirspaceNear,
   formatCoverage,
+  formatDuration,
+  formatMaintenance,
   isEpsilonPlan,
+  needsServerImport,
   nextBaseId,
   nextDroneId,
   nextFreeId,
   normalizeScenario,
+  parseDuration,
   parseGeometryFile,
   parseScenarioText,
   requestBBox,
   requestKey,
   scenarioJSON,
   ScenarioError,
+  splitAirspaceFeatures,
+  type AirspaceChoice,
+  type AirspaceImport,
   type BBox,
   type Criterion,
   type EditTarget,
@@ -107,6 +130,10 @@ function download(name: string, text: string, type: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+// номер для окон выбора: React-ключ, по которому окно пересоздаётся на каждый новый файл
+let pendingSeq = 0
+const nextPendingId = () => ++pendingSeq
+
 const pad2 = (n: number) => String(n).padStart(2, '0')
 const fileStamp = (d: Date) =>
   `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}`
@@ -116,6 +143,14 @@ interface PendingImport {
   id: number
   file: string
   data: ImportedGeometry
+}
+
+/** Разобранные данные заказчика (выгрузка или KML), которые пользователь ещё не подтвердил. */
+interface PendingAirspace {
+  id: number
+  source: string
+  kind: KmlImport['kind'] | ''
+  data: AirspaceImport
 }
 
 /** Ссылка экспорта; у устаревшего плана — неактивна. */
@@ -149,9 +184,26 @@ export default function App() {
   const [paretoBusy, setParetoBusy] = useState(false)
   const [shown, setShown] = useState<Shown | null>(null)
   const [elapsed, setElapsed] = useState(0)
-  const computing = busy || paretoBusy
+  // советник: срок работ («чч:мм» или минуты) и ограничение на число бортов
+  const [deadlineText, setDeadlineText] = useState('')
+  const [maxDronesText, setMaxDronesText] = useState('')
+  const [advice, setAdvice] = useState<AdviceResponse | null>(null)
+  const [adviceBusy, setAdviceBusy] = useState(false)
+  const [adviceError, setAdviceError] = useState<UiError | null>(null)
+  const [adviceShown, setAdviceShown] = useState<{ key: string; deadline: number | null } | null>(null)
+  // данные о воздушном пространстве
+  const [geodata, setGeodata] = useState<GeodataSet[] | null>(null)
+  const [geodataBusy, setGeodataBusy] = useState(false)
+  const [airspaceError, setAirspaceError] = useState<UiError | null>(null)
+  const [airspaceNote, setAirspaceNote] = useState<string | null>(null)
+  const [pendingAirspace, setPendingAirspace] = useState<PendingAirspace | null>(null)
+  const [nearOnly, setNearOnly] = useState(true)
+  const [marginKm, setMarginKm] = useState(10)
+  const [showRestrictions, setShowRestrictions] = useState(true)
+  const [showObstacles, setShowObstacles] = useState(true)
+  const computing = busy || paretoBusy || adviceBusy
 
-  // секундомер для долгих расчётов (фронт Парето — 10–15 с)
+  // секундомер для долгих расчётов (фронт Парето — 10–15 с, советник — 5–60 с)
   useEffect(() => {
     if (!computing) return
     const t0 = Date.now()
@@ -184,6 +236,12 @@ export default function App() {
     setShown(null)
     setError(null)
     setScenarioError(null)
+    setAdvice(null)
+    setAdviceShown(null)
+    setAdviceError(null)
+    setPendingAirspace(null)
+    setAirspaceNote(null)
+    setAirspaceError(null)
     fitTo(requestBBox(s))
   }
 
@@ -211,20 +269,129 @@ export default function App() {
     }
   }
 
+  /** Показать окно выбора для разобранных данных заказчика. Файл с одними полигонами задания
+   *  нужен, чтобы задать область съёмки, — отбор «вблизи области» для него выключаем. */
+  const openAirspace = (p: PendingAirspace) => {
+    setNearOnly(p.data.restrictions.length + p.data.obstacles.length > 0)
+    setPendingAirspace(p)
+  }
+
+  /** KML заказчика разбирает бэкенд: у него есть разбор высот зон и 3D-примитивов препятствий. */
+  const importOnServer = async (name: string, text: string, notes: string[] = []) => {
+    setGeodataBusy(true)
+    try {
+      const res = await api.importKml(text)
+      const data = splitAirspaceFeatures(res.features)
+      if (airspaceEmpty(data)) throw new Error('в файле нет зон ограничений, препятствий и полигонов задания')
+      openAirspace({ id: nextPendingId(), source: name, kind: res.kind, data })
+      setAirspaceNote(null)
+    } catch (e) {
+      const ui = toUiError(e)
+      setImportError({ ...ui, items: [...notes, ...ui.items] })
+    } finally {
+      setGeodataBusy(false)
+    }
+  }
+
   const onGeometryFile = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
     setImportError(null)
     setPendingImport(null)
+    setPendingAirspace(null)
+    const text = await file.text()
+    const isKml = /\.(kml|xml)$/i.test(file.name) || text.trimStart().startsWith('<')
+    let data: ImportedGeometry | null = null
+    let problem = ''
+    let warnings: string[] = []
     try {
-      const data = parseGeometryFile(file.name, await file.text())
-      if (!data.polygons.length && !data.points.length)
-        setImportError({ message: `В файле ${file.name} нет полигонов и точек.`, items: data.warnings, excluded: [] })
-      else setPendingImport({ id: Date.now(), file: file.name, data })
+      data = parseGeometryFile(file.name, text)
+      warnings = data.warnings
+      if (!data.polygons.length && !data.points.length) {
+        problem = `В файле ${file.name} нет полигонов и точек.`
+        data = null
+      }
     } catch (err) {
-      setImportError(toUiError(err))
+      problem = (err as Error).message
     }
+    // данные заказчика (высоты зон, 3D-препятствия) и задание из многих полигонов разбирает
+    // бэкенд: наш парсер свёл бы их к простым контурам без высот и без выбора области
+    if (isKml && needsServerImport(text, data))
+      return importOnServer(file.name, text, problem ? [problem, ...warnings] : warnings)
+    if (!data) return setImportError({ message: problem, items: warnings, excluded: [] })
+    setPendingImport({ id: nextPendingId(), file: file.name, data })
+  }
+
+  /** Список выгрузок данных заказчика (повторное нажатие — закрыть). */
+  const openGeodata = async () => {
+    setAirspaceError(null)
+    if (geodata) {
+      setGeodata(null)
+      return
+    }
+    setGeodataBusy(true)
+    try {
+      setGeodata(await api.geodata())
+    } catch (e) {
+      setAirspaceError(toUiError(e))
+    } finally {
+      setGeodataBusy(false)
+    }
+  }
+
+  const loadGeodataSet = async (s: GeodataSet) => {
+    setAirspaceError(null)
+    setAirspaceNote(null)
+    if (!req.survey_area) {
+      setAirspaceError({
+        message: 'Сначала задайте область съёмки: по ней отбираются зоны и препятствия вблизи работ (в выгрузке их тысячи).',
+        items: [],
+        excluded: [],
+      })
+      return
+    }
+    setGeodataBusy(true)
+    try {
+      const data = splitAirspaceFeatures(await api.geodataSet(s.name))
+      openAirspace({ id: nextPendingId(), source: `${s.name} · ${s.title}`, kind: '', data })
+      setGeodata(null)
+    } catch (e) {
+      setAirspaceError(toUiError(e))
+    } finally {
+      setGeodataBusy(false)
+    }
+  }
+
+  // что из разобранной выгрузки попадёт в запрос: отбор вблизи области съёмки
+  const airspaceNear = useMemo(() => {
+    if (!pendingAirspace) return null
+    return nearOnly && req.survey_area
+      ? filterAirspaceNear(pendingAirspace.data, req.survey_area, marginKm)
+      : pendingAirspace.data
+  }, [pendingAirspace, nearOnly, marginKm, req.survey_area])
+
+  const applyAirspaceChoice = (choice: AirspaceChoice) => {
+    if (!pendingAirspace || !airspaceNear) return
+    const next = applyAirspace(req, airspaceNear, choice)
+    setReq(next)
+    // отчёт «сколько добавлено из скольких»: было в выгрузке → попало в запрос
+    const added: string[] = []
+    if (choice.restrictions && airspaceNear.restrictions.length)
+      added.push(
+        `зон ограничений +${next.restrictions.length - req.restrictions.length} из ${pendingAirspace.data.restrictions.length}`,
+      )
+    if (choice.obstacles && airspaceNear.obstacles.length)
+      added.push(`препятствий +${next.obstacles.length - req.obstacles.length} из ${pendingAirspace.data.obstacles.length}`)
+    if (choice.area !== 'none') {
+      const area = areaFromFeatures(airspaceNear.areas, choice.area)
+      if (area) {
+        added.push('область съёмки заменена')
+        fitTo(bboxOf([area]))
+      }
+    }
+    setAirspaceNote(`${pendingAirspace.source}: ${added.join(', ') || 'ничего не добавлено'}.`)
+    setPendingAirspace(null)
   }
 
   const applyImported = (choice: ImportChoice) => {
@@ -321,6 +488,34 @@ export default function App() {
     }
   }
 
+  // срок работ: «2:30» или число минут; строка — текст ошибки, null — срок не задан
+  const deadline = useMemo(() => parseDuration(deadlineText), [deadlineText])
+  const deadlineS = typeof deadline === 'number' ? deadline : null
+  const deadlineError = typeof deadline === 'string' ? deadline : null
+  const maxDrones = maxDronesText.trim() ? Math.max(1, Math.floor(+maxDronesText)) : null
+
+  const runAdvise = async () => {
+    const snapshot = req
+    setElapsed(0)
+    setAdviceBusy(true)
+    setAdviceError(null)
+    try {
+      const a = await api.advise(snapshot, { deadline_s: deadlineS, max_drones: maxDrones })
+      setAdvice(a)
+      setAdviceShown({ key: requestKey(snapshot), deadline: deadlineS })
+    } catch (e) {
+      const ui = toUiError(e)
+      // бэкенд считает фронт Парето и подсказку по одной за раз
+      if (e instanceof ApiError && e.status === 503)
+        ui.items = ['Одновременно идёт только один тяжёлый расчёт (фронт Парето или советник) — подождите и повторите.']
+      setAdviceError(ui)
+      setAdvice(null)
+      setAdviceShown(null)
+    } finally {
+      setAdviceBusy(false)
+    }
+  }
+
   const idErrors = useMemo(() => droneIdErrors(req.drones), [req.drones])
   const hasIdErrors = Object.keys(idErrors).length > 0
   const currentKey = useMemo(() => requestKey(req), [req])
@@ -330,6 +525,19 @@ export default function App() {
   const canRun = req.survey_area && req.bases.length > 0 && req.drones.length > 0 && !hasIdErrors && !computing
   const setReqField = <K extends keyof PlanRequest['requirements']>(k: K, v: PlanRequest['requirements'][K]) =>
     setReq((r) => ({ ...r, requirements: { ...r.requirements, [k]: v } }))
+
+  const adviceStale = !!adviceShown && adviceShown.key !== currentKey
+  const canAdvise = !!canRun && !deadlineError
+
+  // на карте — воздушное пространство из ответа (там есть applies и skip_reason), иначе из запроса
+  const mapRestrictions = useMemo(
+    () => (plan && !stale && plan.restrictions?.length ? plan.restrictions : req.restrictions),
+    [plan, stale, req.restrictions],
+  )
+  const mapObstacles = useMemo(
+    () => (plan && !stale && plan.obstacles?.length ? plan.obstacles : req.obstacles),
+    [plan, stale, req.obstacles],
+  )
 
   const droneColor = useMemo(() => {
     const m: Record<string, string> = {}
@@ -435,10 +643,102 @@ export default function App() {
                 <button className="link" onClick={() => setReq({ ...req, reserve_sites: req.reserve_sites.filter((_, j) => j !== i) })}>✕</button>
               </span>
             ))}
-            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null); setFront(null); setShown(null); setError(null); setScenarioName('') }}>
+            <button className="link" onClick={() => { setReq(EMPTY); setPlan(null); setFront(null); setShown(null); setError(null); setScenarioName(''); setAdvice(null); setAdviceShown(null); setAirspaceNote(null); setPendingAirspace(null) }}>
               очистить всё
             </button>
           </div>
+        </section>
+
+        <section>
+          <h2>Воздушное пространство</h2>
+          <div className="buttons">
+            <button
+              className={geodata ? 'active' : ''}
+              disabled={geodataBusy}
+              onClick={openGeodata}
+              title="Выгрузки заказчика: зоны ограничений, высотные препятствия, полигоны задания"
+            >
+              {geodataBusy ? (
+                <>
+                  <span className="spinner dark" /> Загрузка…
+                </>
+              ) : (
+                'Данные о воздушном пространстве'
+              )}
+            </button>
+          </div>
+          {geodata && (
+            <ul className="geodata">
+              {geodata.map((s) => (
+                <li key={s.name}>
+                  <button className="link" onClick={() => loadGeodataSet(s)}>
+                    {s.name}
+                  </button>
+                  <small>
+                    {s.title} · объектов {s.features} · {s.size_kb} КБ
+                  </small>
+                </li>
+              ))}
+              {!geodata.length && <li>выгрузок рядом с сервисом нет</li>}
+            </ul>
+          )}
+          {airspaceError && <ErrorBox error={airspaceError} />}
+          {airspaceNote && <p className="hint">{airspaceNote}</p>}
+          {pendingAirspace && airspaceNear && (
+            <AirspaceChooser
+              key={pendingAirspace.id}
+              source={pendingAirspace.source}
+              kind={pendingAirspace.kind}
+              data={airspaceNear}
+              total={pendingAirspace.data}
+              hasArea={!!req.survey_area}
+              nearOnly={nearOnly}
+              marginKm={marginKm}
+              onNearOnly={setNearOnly}
+              onMarginKm={setMarginKm}
+              onApply={applyAirspaceChoice}
+              onCancel={() => setPendingAirspace(null)}
+            />
+          )}
+          <div className="objects">
+            {req.restrictions.length > 0 && (
+              <span className="chip zone">
+                зоны ограничений: {req.restrictions.length}
+                <button className="link" onClick={() => setReq({ ...req, restrictions: [] })}>
+                  ✕
+                </button>
+              </span>
+            )}
+            {req.obstacles.length > 0 && (
+              <span className="chip obstacle">
+                препятствия: {req.obstacles.length}
+                <button className="link" onClick={() => setReq({ ...req, obstacles: [] })}>
+                  ✕
+                </button>
+              </span>
+            )}
+            {!req.restrictions.length && !req.obstacles.length && (
+              <span className="hint">Зоны и препятствия не заданы — планировщик учтёт только запретные зоны с карты.</span>
+            )}
+          </div>
+          <label>
+            <span>Показывать зоны ограничений</span>
+            <input
+              type="checkbox"
+              checked={showRestrictions}
+              onChange={(e) => setShowRestrictions(e.target.checked)}
+              disabled={!mapRestrictions.length}
+            />
+          </label>
+          <label>
+            <span>Показывать препятствия</span>
+            <input
+              type="checkbox"
+              checked={showObstacles}
+              onChange={(e) => setShowObstacles(e.target.checked)}
+              disabled={!mapObstacles.length}
+            />
+          </label>
         </section>
 
         <section>
@@ -576,6 +876,27 @@ export default function App() {
             <input type="number" min="0" max="60" value={Math.round(req.reserve * 100)}
               onChange={(e) => setReq({ ...req, reserve: +e.target.value / 100 })} />
           </label>
+          <label>
+            Начало работ
+            <input type="datetime-local" value={datetimeLocalValue(req.mission_start)}
+              onChange={(e) => setReq({ ...req, mission_start: e.target.value || null })} />
+          </label>
+          <label>
+            Окно работ, ч
+            <input type="number" min="1" max="168" value={req.mission_window_h}
+              onChange={(e) => setReq({ ...req, mission_window_h: +e.target.value })} />
+          </label>
+          <p className="hint">Окно работ нужно временным зонам: зона, не действующая в это время, в расчёт не идёт.</p>
+          <label>
+            Зазор над препятствием, м
+            <input type="number" min="0" max="1000" value={req.obstacle_clearance_m}
+              onChange={(e) => setReq({ ...req, obstacle_clearance_m: +e.target.value })} />
+          </label>
+          <label>
+            Обход препятствия, м
+            <input type="number" min="0" max="10000" value={req.obstacle_buffer_m}
+              onChange={(e) => setReq({ ...req, obstacle_buffer_m: +e.target.value })} />
+          </label>
         </section>
 
         <section>
@@ -614,6 +935,89 @@ export default function App() {
           {error && <ErrorBox error={error} />}
         </section>
 
+        <section>
+          <h2>Советник</h2>
+          <label>
+            Срок работ
+            <input
+              type="text"
+              inputMode="text"
+              placeholder="чч:мм или минуты"
+              className={deadlineError ? 'invalid' : ''}
+              aria-invalid={!!deadlineError}
+              value={deadlineText}
+              onChange={(e) => setDeadlineText(e.target.value)}
+            />
+          </label>
+          {deadlineError ? (
+            <p className="field-error">{deadlineError}</p>
+          ) : deadlineS ? (
+            <p className="hint">Срок — {formatDuration(deadlineS)}.</p>
+          ) : (
+            <p className="hint">Без срока подскажем, за сколько справится парк и сколько бортов для этого нужно.</p>
+          )}
+          <label>
+            Не больше бортов
+            <input
+              type="number"
+              min="1"
+              max={Math.max(req.drones.length, 1)}
+              placeholder="весь парк"
+              value={maxDronesText}
+              onChange={(e) => setMaxDronesText(e.target.value)}
+            />
+          </label>
+          <button className="secondary" disabled={!canAdvise} onClick={runAdvise}>
+            {adviceBusy ? (
+              <>
+                <span className="spinner dark" /> Считаем варианты… {elapsed} с
+              </>
+            ) : (
+              'Подсказать'
+            )}
+          </button>
+          <p className="hint">Расчёт 5–60 с: строится план для 1, 2, … бортов по убыванию производительности.</p>
+          {adviceError && <ErrorBox error={adviceError} />}
+          {advice && (
+            <div className={adviceStale ? 'advice stale' : 'advice'}>
+              {adviceStale && <p className="hint">Входные данные изменились — подсказка относится к прежним.</p>}
+              <p className="advice-message">{advice.message}</p>
+              <AdviceChart options={advice.options} deadlineS={adviceShown?.deadline ?? null} />
+              <table>
+                <thead>
+                  <tr>
+                    <th>Бортов</th>
+                    <th>Борта</th>
+                    <th>Работы</th>
+                    <th>Налёт</th>
+                    <th>Вылетов</th>
+                    <th>Покрытие</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {advice.options.map((o, i) => (
+                    <tr
+                      key={i}
+                      className={o.reason ? 'bad' : advice.drones_needed === o.drones ? 'pick' : ''}
+                      title={o.reason || undefined}
+                    >
+                      <td>{o.drones}</td>
+                      <td>
+                        {o.drone_ids.join(', ') || '—'}
+                        {o.reason && <small>не покрывает область</small>}
+                      </td>
+                      <td>{o.makespan_s != null ? min(o.makespan_s) : '—'}</td>
+                      <td>{o.total_flight_s != null ? min(o.total_flight_s) : '—'}</td>
+                      <td>{o.sorties ?? '—'}</td>
+                      <td>{o.coverage_pct != null ? `${formatCoverage(o.coverage_pct)}%` : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
         {plan && (
           <section className="result">
             {stale && (
@@ -646,12 +1050,28 @@ export default function App() {
                 {plan.drones.map((d) => (
                   <tr key={d.drone_id} title={d.params.notes.join('; ')}>
                     <td><span className="swatch" style={{ background: droneColor[d.drone_id] }} /></td>
-                    <td>{d.drone_id}<small>{d.payload} · {d.area_km2.toFixed(2)} км²</small></td>
+                    <td>
+                      {d.drone_id}
+                      <small>{d.payload} · {d.area_km2.toFixed(2)} км²</small>
+                      {formatMaintenance(d.maintenance) && (
+                        <small
+                          className={d.maintenance?.due ? 'due' : ''}
+                          title={
+                            d.maintenance?.interval_flights
+                              ? `норматив: каждые ${d.maintenance.interval_flights} полётов, после задания — ${d.maintenance.flights_after}`
+                              : `норматив: каждые ${d.maintenance?.interval_hours} ч, после задания — ${d.maintenance?.hours_after} ч`
+                          }
+                        >
+                          {formatMaintenance(d.maintenance)}
+                          {d.maintenance?.due ? ' — ТО в этом задании' : ''}
+                        </small>
+                      )}
+                    </td>
                     <td>{d.params.altitude_agl_m.toFixed(0)}</td>
                     <td>{d.sorties.length}</td>
                     <td>{min(d.flight_time_s)}</td>
                     <td>{min(d.finish_s)}</td>
-                    <td>{min(Math.max(...d.sorties.map((s) => s.max_divert_s)))}</td>
+                    <td>{d.sorties.length ? min(Math.max(...d.sorties.map((s) => s.max_divert_s))) : '—'}</td>
                     <td>
                       <ExportLink stale={stale} href={api.exportUrl(plan.plan_id, d.drone_id, 'geojson')}>GeoJSON</ExportLink>{' '}
                       <ExportLink stale={stale} href={api.exportUrl(plan.plan_id, d.drone_id, 'kml')}>KML</ExportLink>
@@ -667,6 +1087,7 @@ export default function App() {
                 Рельеф {plan.terrain.ground_min_m.toFixed(0)}–{plan.terrain.ground_max_m.toFixed(0)} м. {plan.terrain.source}
               </p>
             )}
+            {airspaceSummary(plan.airspace) && <p className="hint">{airspaceSummary(plan.airspace)}</p>}
             {plan.excluded.length > 0 && (
               <ul className="excluded">
                 {plan.excluded.map((e) => (
@@ -695,6 +1116,11 @@ export default function App() {
           editing={editing}
           onEdited={onEdited}
           fit={fit}
+          restrictions={mapRestrictions}
+          obstacles={mapObstacles}
+          showRestrictions={showRestrictions}
+          showObstacles={showObstacles}
+          obstacleBufferM={req.obstacle_buffer_m}
         />
         <div className="map-notes">
           {drawMode && (

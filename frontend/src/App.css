@@ -45,6 +45,10 @@ label input,
 label select {
   width: 150px;
 }
+/* флажок шириной 150px растягивал бы строку и переносил подпись */
+label input[type='checkbox'] {
+  width: auto;
+}
 select,
 input {
   font: inherit;
@@ -319,6 +323,12 @@ td small {
 .import-box label select {
   width: 230px;
 }
+.import-box label span {
+  flex: 1;
+}
+.import-box label input[type='number'] {
+  width: 80px;
+}
 .import-box .warnings {
   margin: 6px 0;
 }
@@ -437,4 +447,90 @@ p.field-error {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* воздушное пространство: выгрузки заказчика, слои карты */
+.geodata {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  font-size: 13px;
+}
+.geodata li {
+  padding: 2px 0;
+  border-bottom: 1px solid #eee;
+}
+.geodata small {
+  display: block;
+  color: #888;
+  font-size: 11px;
+  padding-left: 4px;
+}
+.chip.zone {
+  background: #fde2e2;
+}
+.chip.obstacle {
+  background: #f1e6cf;
+}
+.legend .l-zone {
+  height: 10px;
+  border: 2px solid #d62828;
+  background: rgba(214, 40, 40, 0.18);
+}
+.legend .l-zone.off {
+  border-style: dashed;
+  background: none;
+}
+.legend .l-obstacle {
+  height: 10px;
+  border: 2px solid #6b4b00;
+  background: rgba(107, 75, 0, 0.35);
+}
+
+/* советник: ответ крупно, кривая, таблица вариантов */
+.advice-message {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 8px 0;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #c9d3e0;
+  border-left: 3px solid #1d3557;
+  border-radius: 4px;
+}
+.advice.stale {
+  opacity: 0.5;
+  filter: grayscale(0.7);
+}
+.advice tr.pick {
+  background: #eef7ee;
+}
+.advice tr.pick td {
+  font-weight: 600;
+}
+.advice tr.bad td {
+  color: #a15c00;
+}
+.chart .deadline {
+  stroke: #c00;
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+}
+.chart .deadline-label {
+  fill: #c00;
+}
+.chart .pt.bad {
+  fill: #fff;
+  stroke: #e0a800;
+}
+input.invalid {
+  border: 1px solid #c00;
+  background: #fff0f0;
+}
+
+/* остаток ресурса до ТО в карточке борта */
+td small.due {
+  color: #c00;
+  font-weight: 600;
 }

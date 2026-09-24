@@ -4,8 +4,17 @@ import '@geoman-io/leaflet-geoman-free'
 import 'leaflet/dist/leaflet.css'
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css'
 import type { MultiPolygon, Polygon } from 'geojson'
-import type { PlanRequest, PlanResponse, Site } from './api'
-import { cleanPolygonGeometry, type BBox, type EditTarget, type EditValue } from './logic'
+import type { ObstacleFeature, PlanRequest, PlanResponse, RestrictionFeature, Site } from './api'
+import {
+  altBandLabel,
+  cleanPolygonGeometry,
+  obstacleTopLabel,
+  obstacleTypeLabel,
+  zoneTypeLabel,
+  type BBox,
+  type EditTarget,
+  type EditValue,
+} from './logic'
 
 export type DrawMode = 'survey' | 'allowed' | 'nfz' | 'base' | 'reserve' | null
 
@@ -28,11 +37,64 @@ interface Props {
   editing: boolean
   onEdited: (target: EditTarget, value: EditValue) => void
   fit: FitRequest
+  /** зоны ограничений: из ответа (с applies/skip_reason) или из запроса */
+  restrictions: RestrictionFeature[]
+  obstacles: ObstacleFeature[]
+  showRestrictions: boolean
+  showObstacles: boolean
+  /** радиус круга для точечных препятствий — горизонтальный обход из запроса, м */
+  obstacleBufferM: number
 }
 
 const RESULTS_PANE = 'results'
 // ВПП и резервные площадки — над маршрутами: перелёты начинаются в них и иначе перехватывают мышь
 const SITES_PANE = 'sites'
+// воздушное пространство — над входными полигонами (иначе область съёмки перехватывает клики по
+// зонам), но под маршрутами и площадками: zIndex тот же, порядок решает очередь создания панелей
+const AIRSPACE_PANE = 'airspace'
+
+/** Цвет зоны по типу ограничения. */
+const ZONE_COLORS: Record<string, string> = {
+  prohibited: '#8b0000',
+  permanent: '#d62828',
+  temporary: '#e08a00',
+  special: '#7b2cbf',
+  unknown: '#6c757d',
+}
+
+const OBSTACLE_COLOR = '#6b4b00'
+
+const esc = (s: unknown): string =>
+  String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] ?? c)
+
+/** Попап зоны ограничения: название, тип, высоты исходной строкой, время, причина пропуска. */
+function restrictionPopup(f: RestrictionFeature): string {
+  const p = f.properties ?? {}
+  const rows = [
+    `<b>${esc(p.name || p.id || 'зона ограничения')}</b>`,
+    esc(zoneTypeLabel(p.zone_type)),
+    `высоты: ${esc(altBandLabel(p.alt))}`,
+  ]
+  const act = p.active
+  if (act?.daily?.length === 2) rows.push(`действует ежедневно ${esc(act.daily[0])}–${esc(act.daily[1])}`)
+  if (act?.from || act?.to) rows.push(`срок: ${esc(act.from ?? '—')} … ${esc(act.to ?? '—')}`)
+  if (p.notes) rows.push(esc(p.notes))
+  if (p.applies === false) rows.push(`<i>не учтена: ${esc(p.skip_reason || 'не мешает работам')}</i>`)
+  else if (p.applies) rows.push('<i>учтена в расчёте как запретная зона</i>')
+  return rows.join('<br>')
+}
+
+/** Попап препятствия: тип, верх с отсчётом, верх над землёй области. */
+function obstaclePopup(f: ObstacleFeature): string {
+  const p = f.properties ?? {}
+  const rows = [
+    `<b>${esc(obstacleTypeLabel(p.obstacle_type))}${p.id ? ` ${esc(p.id)}` : ''}</b>`,
+    `верх: ${esc(obstacleTopLabel(p.top_m, p.top_ref))}`,
+  ]
+  if (p.top_agl_m != null) rows.push(`над землёй области: ${esc(Math.round(p.top_agl_m))} м`)
+  if (p.blocks) rows.push('<i>выше высоты съёмки — облетается</i>')
+  return rows.join('<br>')
+}
 
 // правка полигона: только вершины (сам полигон не таскаем — иначе легко сдвинуть его вместо карты),
 // меньше трёх вершин не оставляем; у больших импортированных контуров показываем ближайшие вершины
@@ -45,11 +107,26 @@ const POLYGON_EDIT: L.PM.EditModeOptions = {
 // площадку можно только перетащить: удаление правым кликом и изменение радиуса выключены
 const SITE_EDIT: L.PM.EditModeOptions = { draggable: true, snappable: false, preventMarkerRemoval: true }
 
-export default function MapView({ req, plan, stale, drawMode, onDrawn, editing, onEdited, fit }: Props) {
+export default function MapView({
+  req,
+  plan,
+  stale,
+  drawMode,
+  onDrawn,
+  editing,
+  onEdited,
+  fit,
+  restrictions,
+  obstacles,
+  showRestrictions,
+  showObstacles,
+  obstacleBufferM,
+}: Props) {
   const el = useRef<HTMLDivElement>(null)
   const map = useRef<L.Map | null>(null)
   const inputs = useRef<L.LayerGroup>(L.layerGroup())
   const results = useRef<L.LayerGroup>(L.layerGroup())
+  const airspace = useRef<L.LayerGroup>(L.layerGroup())
   const modeRef = useRef<DrawMode>(null)
   const onDrawnRef = useRef(onDrawn)
   onDrawnRef.current = onDrawn
@@ -70,8 +147,10 @@ export default function MapView({ req, plan, stale, drawMode, onDrawn, editing, 
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(m)
     // маршруты — в отдельной панели, чтобы приглушать их целиком
+    m.createPane(AIRSPACE_PANE).style.zIndex = '400'
     m.createPane(RESULTS_PANE).style.zIndex = '400'
     m.createPane(SITES_PANE).style.zIndex = '450'
+    airspace.current.addTo(m)
     results.current.addTo(m)
     inputs.current.addTo(m)
     m.pm.setLang('ru')
@@ -161,6 +240,51 @@ export default function MapView({ req, plan, stale, drawMode, onDrawn, editing, 
     )
   }, [req, editing, restore])
 
+  // воздушное пространство: зоны ограничений и высотные препятствия (только показ, не правятся)
+  useEffect(() => {
+    const g = airspace.current
+    g.clearLayers()
+    // при рисовании и правке попапы зон только мешают — слой перестаёт ловить мышь
+    const out = { pane: AIRSPACE_PANE, pmIgnore: true, interactive: !drawMode && !editing }
+    if (showRestrictions)
+      for (const f of restrictions) {
+        if (!f?.geometry) continue
+        const color = ZONE_COLORS[f.properties?.zone_type ?? 'unknown'] ?? ZONE_COLORS.unknown
+        // применённая зона — с заливкой, отфильтрованная — только контур пунктиром
+        const off = f.properties?.applies === false
+        L.geoJSON(f, {
+          ...out,
+          style: () => ({
+            color,
+            weight: off ? 1 : 2,
+            dashArray: off ? '5 5' : undefined,
+            fillColor: color,
+            fillOpacity: off ? 0 : 0.18,
+          }),
+        })
+          .bindPopup(restrictionPopup(f))
+          .addTo(g)
+      }
+    if (showObstacles)
+      for (const f of obstacles) {
+        if (!f?.geometry) continue
+        const style: L.PathOptions = {
+          color: OBSTACLE_COLOR,
+          weight: 2,
+          fillColor: OBSTACLE_COLOR,
+          fillOpacity: 0.35,
+        }
+        L.geoJSON(f, {
+          ...out,
+          style: () => style,
+          // точечное препятствие — круг радиусом обхода (метры), линия ЛЭП — линия как есть
+          pointToLayer: (_f, latlng) => L.circle(latlng, { ...style, ...out, radius: Math.max(obstacleBufferM, 5) }),
+        })
+          .bindPopup(obstaclePopup(f))
+          .addTo(g)
+      }
+  }, [restrictions, obstacles, showRestrictions, showObstacles, obstacleBufferM, drawMode, editing])
+
   // результаты
   useEffect(() => {
     const g = results.current
@@ -215,6 +339,15 @@ export default function MapView({ req, plan, stale, drawMode, onDrawn, editing, 
         <div><i className="l-turn" /> разворот</div>
         <div><i className="l-transit" /> перелёт / возврат</div>
         <div><i className="l-nfz" /> запретная зона</div>
+        {showRestrictions && restrictions.length > 0 && (
+          <>
+            <div><i className="l-zone applied" /> зона ограничений в расчёте</div>
+            <div><i className="l-zone off" /> зона не мешает работам</div>
+          </>
+        )}
+        {showObstacles && obstacles.length > 0 && (
+          <div><i className="l-obstacle" /> высотное препятствие</div>
+        )}
       </div>
     </>
   )

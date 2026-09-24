@@ -3,22 +3,42 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Polygon } from 'geojson'
-import type { PlanRequest, PlanResponse } from '../src/api.ts'
+import type { MultiPolygon, Polygon } from 'geojson'
+import type { AreaFeature, Maintenance, PlanRequest, PlanResponse } from '../src/api.ts'
 import {
+  airspaceEmpty,
+  airspaceSummary,
+  altBandLabel,
+  applyAirspace,
   applyEdit,
   applyImport,
+  areaFromFeatures,
   bboxOf,
   cleanPolygonGeometry,
   criterionLabel,
+  countVertices,
+  datetimeLocalValue,
   droneIdErrors,
   EMPTY_REQUEST,
+  expandBBox,
+  filterAirspaceNear,
+  filterFeaturesNear,
   formatCoverage,
+  formatDuration,
+  formatMaintenance,
   formatValidationItem,
+  geometryBBox,
   isEpsilonPlan,
+  looksLikeAirspaceKml,
+  MANY_POLYGONS,
+  MAX_VERTICES,
+  needsServerImport,
   nextBaseId,
   nextDroneId,
   normalizeScenario,
+  obstacleTopLabel,
+  obstacleTypeLabel,
+  parseDuration,
   parseErrorDetail,
   parseGeoJSONText,
   parseGeometryFile,
@@ -29,6 +49,10 @@ import {
   requestKey,
   scenarioJSON,
   ScenarioError,
+  normalizePolygonDropHoles,
+  splitAirspaceFeatures,
+  zoneTypeLabel,
+  type AirspaceImport,
 } from '../src/logic.ts'
 
 const req = (over: Partial<PlanRequest> = {}): PlanRequest => ({
@@ -44,6 +68,12 @@ const req = (over: Partial<PlanRequest> = {}): PlanRequest => ({
   time_weight: 1,
   reserve: 0.2,
   nfz_buffer_m: 30,
+  restrictions: [],
+  obstacles: [],
+  obstacle_clearance_m: 30,
+  obstacle_buffer_m: 50,
+  mission_start: null,
+  mission_window_h: 12,
   ...over,
 })
 
@@ -418,4 +448,237 @@ test('сценарии бэкенда (backend/data/scenarios) загружаю�
     assert.ok(s.survey_area, f)
     assert.deepEqual(parseScenarioText(scenarioJSON(s)), s, f)
   }
+})
+
+// ---------- Советник: срок работ, длительности, ресурс до ТО ----------
+
+test('срок работ: «чч:мм», минуты, часы и ошибки ввода', () => {
+  assert.equal(parseDuration('2:30'), 9000)
+  assert.equal(parseDuration('0:45'), 2700)
+  assert.equal(parseDuration('150'), 9000)
+  assert.equal(parseDuration(' 90 мин '), 5400)
+  assert.equal(parseDuration('2ч30'), 9000)
+  assert.equal(parseDuration('2 ч 30 мин'), 9000)
+  assert.equal(parseDuration('3ч'), 10800)
+  assert.equal(parseDuration('1,5 ч'), 5400)
+  assert.equal(parseDuration(''), null)
+  assert.equal(parseDuration('   '), null)
+  // ошибки — текстом для пользователя
+  assert.match(String(parseDuration('2:75')), /меньше 60/)
+  assert.match(String(parseDuration('0')), /больше нуля/)
+  assert.match(String(parseDuration('0:00')), /больше нуля/)
+  assert.match(String(parseDuration('200 ч')), /недели/)
+  assert.match(String(parseDuration('скоро')), /чч:мм/)
+})
+
+test('длительность и дата: формат для сообщений и полей ввода', () => {
+  assert.equal(formatDuration(9000), '2 ч 30 мин')
+  assert.equal(formatDuration(3600), '1 ч 00 мин')
+  assert.equal(formatDuration(2700), '45 мин')
+  assert.equal(formatDuration(0), '0 мин')
+  assert.equal(datetimeLocalValue('2026-09-29T06:00:00+03:00'), '2026-09-29T06:00')
+  assert.equal(datetimeLocalValue('2026-09-29T06:00'), '2026-09-29T06:00')
+  assert.equal(datetimeLocalValue(null), '')
+  assert.equal(datetimeLocalValue('когда-нибудь'), '')
+})
+
+test('остаток ресурса до ТО: полёты, часы, просроченное ТО', () => {
+  const m = (over: Partial<Maintenance>): Maintenance => ({
+    interval_flights: null,
+    interval_hours: null,
+    flights_before: 0,
+    hours_before: 0,
+    flights_after: 0,
+    hours_after: 0,
+    remaining_flights: null,
+    remaining_hours: null,
+    due: false,
+    ...over,
+  })
+  assert.equal(formatMaintenance(m({ remaining_flights: 78 })), 'до ТО: 78 полётов')
+  assert.equal(formatMaintenance(m({ remaining_flights: 1 })), 'до ТО: 1 полёт')
+  assert.equal(formatMaintenance(m({ remaining_flights: 3 })), 'до ТО: 3 полёта')
+  assert.equal(formatMaintenance(m({ remaining_flights: 11 })), 'до ТО: 11 полётов')
+  assert.equal(formatMaintenance(m({ remaining_flights: -2, due: true })), 'до ТО: -2 полёта')
+  assert.equal(formatMaintenance(m({ remaining_hours: 159.2 })), 'до ТО: 159,2 ч')
+  assert.equal(formatMaintenance(m({})), null)
+  assert.equal(formatMaintenance(null), null)
+})
+
+test('сводка по воздушному пространству', () => {
+  assert.equal(
+    airspaceSummary({
+      restrictions_total: 37,
+      restrictions_applied: 4,
+      obstacles_total: 120,
+      obstacles_blocking: 8,
+      alt_band_agl_m: [0, 210.4],
+    }),
+    'зоны ограничений: учтено 4 из 37; высотные препятствия: 8 из 120 мешают, полоса высот работ 0–210 м',
+  )
+  assert.equal(airspaceSummary(null), null)
+  assert.equal(
+    airspaceSummary({
+      restrictions_total: 0,
+      restrictions_applied: 0,
+      obstacles_total: 0,
+      obstacles_blocking: 0,
+      alt_band_agl_m: [],
+    }),
+    null,
+  )
+})
+
+// ---------- Данные о воздушном пространстве: отбор вблизи области ----------
+
+const feat = (geometry: unknown, properties: Record<string, unknown> = {}) => ({
+  type: 'Feature',
+  geometry,
+  properties,
+})
+
+test('охват геометрии: точка, линия, полигон, GeometryCollection', () => {
+  assert.deepEqual(geometryBBox({ type: 'Point', coordinates: [37.5, 55.6] }), [37.5, 55.6, 37.5, 55.6])
+  assert.deepEqual(geometryBBox({ type: 'LineString', coordinates: [[37, 55], [38, 56]] }), [37, 55, 38, 56])
+  assert.deepEqual(geometryBBox(feat(square(37, 55, 1))), [37, 55, 38, 56])
+  assert.deepEqual(
+    geometryBBox({
+      type: 'GeometryCollection',
+      geometries: [{ type: 'Point', coordinates: [10, 20] }, { type: 'Point', coordinates: [11, 19] }],
+    }),
+    [10, 19, 11, 20],
+  )
+  assert.equal(geometryBBox({ type: 'Polygon', coordinates: [] }), null)
+  assert.equal(geometryBBox(null), null)
+})
+
+test('расширение охвата на километры: по долготе — с поправкой на широту', () => {
+  const [w, s, e, n] = expandBBox([37, 55, 37, 55], 11.132)
+  assert.ok(Math.abs(n - 55.1) < 1e-9 && Math.abs(s - 54.9) < 1e-9)
+  // на широте 55° градус долготы короче — запас по долготе шире, чем по широте
+  assert.ok(e - 37 > 0.17 && e - 37 < 0.18)
+  assert.ok(Math.abs(37 - w - (e - 37)) < 1e-9)
+  // за полюс и меридиан не выходим
+  const big = expandBBox([179.99, 89.99, 179.99, 89.99], 1000)
+  assert.deepEqual([big[0], big[2], big[3]], [-180, 180, 90])
+  assert.ok(big[1] > 81 && big[1] < 82)
+})
+
+test('объекты вблизи области: далёкие отбрасываются, близкие остаются', () => {
+  const area = square(37, 55, 1) // охват [37, 55, 38, 56]
+  const near = feat({ type: 'Point', coordinates: [38.05, 55.5] }) // ~3 км за восточной границей
+  const far = feat({ type: 'Point', coordinates: [40, 55.5] })
+  const line = feat({ type: 'LineString', coordinates: [[36.9, 54.95], [36.95, 55]] })
+  assert.deepEqual(filterFeaturesNear([near, far, line], area, 10), [near, line])
+  assert.deepEqual(filterFeaturesNear([near, far], area, 0), [])
+  // без области съёмки отбирать не от чего
+  assert.deepEqual(filterFeaturesNear([near], null, 10), [])
+})
+
+test('разбор выгрузки по видам объектов', () => {
+  const zone = feat(square(37, 55), { kind: 'restriction', id: 'UUR1' })
+  const obstacle = feat({ type: 'LineString', coordinates: [[37, 55], [37.1, 55.1]] }, { kind: 'obstacle', id: 'o1' })
+  const task = feat(square(37.2, 55.2), { kind: 'survey_area', id: '1491' })
+  // без kind: alt — зона, top_m — препятствие, полигон — задание на съёмку
+  const guessZone = feat(square(37.3, 55.3), { alt: { lower_m: 0, upper_m: 500 } })
+  const guessObstacle = feat({ type: 'Point', coordinates: [37.4, 55.4] }, { top_m: 77 })
+  const junk = feat({ type: 'LineString', coordinates: [[0, 0], [1, 1]] })
+  const s = splitAirspaceFeatures({
+    type: 'FeatureCollection',
+    features: [zone, obstacle, task, guessZone, guessObstacle, junk],
+  })
+  assert.deepEqual(s.restrictions, [zone, guessZone])
+  assert.deepEqual(s.obstacles, [obstacle, guessObstacle])
+  assert.deepEqual(s.areas, [task])
+  assert.equal(s.skipped, 1)
+  assert.ok(airspaceEmpty(splitAirspaceFeatures(null)))
+  assert.ok(!airspaceEmpty(s))
+  // отбор вблизи области работает по всем видам сразу
+  const near = filterAirspaceNear(s, square(37, 55), 5)
+  assert.deepEqual([near.restrictions.length, near.obstacles.length, near.areas.length], [1, 1, 0])
+  const wide = filterAirspaceNear(s, square(37, 55), 50)
+  assert.deepEqual([wide.restrictions.length, wide.obstacles.length, wide.areas.length], [2, 2, 1])
+  assert.equal(filterAirspaceNear(s, square(50, 55), 5).restrictions.length, 0)
+})
+
+test('область съёмки из полигонов задания: один или объединение', () => {
+  const a = feat(square(37, 55), { id: 'a' })
+  const b = feat(square(38, 55), { id: 'b' })
+  const areas = [a, b] as unknown as AreaFeature[]
+  const one = areaFromFeatures(areas, 0)
+  assert.equal(one?.type, 'Polygon')
+  const all = areaFromFeatures(areas, 'union')
+  assert.equal(all?.type, 'MultiPolygon')
+  assert.equal((all as MultiPolygon).coordinates.length, 2)
+  assert.equal(areaFromFeatures([], 'union'), null)
+  assert.equal(areaFromFeatures(areas, 5), null)
+  assert.equal(countVertices(one), 5)
+  assert.equal(countVertices(all), 10)
+  assert.equal(MAX_VERTICES, 20000)
+})
+
+test('данные о воздушном пространстве в запросе: добавление, повторы, замена области', () => {
+  const imp = {
+    restrictions: [feat(square(37, 55), { kind: 'restriction', id: 'UUR1' })],
+    obstacles: [feat({ type: 'Point', coordinates: [37.5, 55.5] }, { kind: 'obstacle', id: 'o1' })],
+    areas: [feat(square(37.1, 55.1), { kind: 'survey_area', id: '1' })],
+    skipped: 0,
+  } as unknown as AirspaceImport
+  const r1 = applyAirspace(req(), imp, { restrictions: true, obstacles: true, area: 'none' })
+  assert.equal(r1.restrictions.length, 1)
+  assert.equal(r1.obstacles.length, 1)
+  assert.equal(r1.survey_area, null)
+  // повторная загрузка той же выгрузки не удваивает объекты
+  const r2 = applyAirspace(r1, imp, { restrictions: true, obstacles: true, area: 0 })
+  assert.equal(r2.restrictions.length, 1)
+  assert.equal(r2.obstacles.length, 1)
+  assert.equal(r2.survey_area?.type, 'Polygon')
+  // ничего не выбрано — запрос остаётся тем же объектом
+  assert.equal(applyAirspace(r1, imp, { restrictions: false, obstacles: false, area: 'none' }), r1)
+})
+
+test('KML заказчика узнаётся по высотам зон и 3D-примитивам', () => {
+  assert.ok(looksLikeAirspaceKml('<Data name="Altitudes"><value>От земли до 500 м AMSL</value></Data>'))
+  assert.ok(looksLikeAirspaceKml('<Placemark><Polygon><extrude>1</extrude>'))
+  assert.ok(looksLikeAirspaceKml('<altitudeMode>relativeToGround</altitudeMode>'))
+  assert.ok(!looksLikeAirspaceKml('<Placemark><name>Участок 1</name><Polygon><outerBoundaryIs>'))
+})
+
+test('на разбор бэкенду уходят данные заказчика и задание из многих полигонов', () => {
+  const simple = { polygons: [square(37, 55)], points: [], warnings: [] }
+  const many = { polygons: Array.from({ length: MANY_POLYGONS + 1 }, (_, i) => square(37 + i / 100, 55)), points: [], warnings: [] }
+  assert.equal(needsServerImport('<kml><Placemark>', simple), false)
+  assert.equal(needsServerImport('<kml><Placemark>', null), true) // клиентский парсер не справился
+  assert.equal(needsServerImport('<kml><extrude>1</extrude>', simple), true)
+  assert.equal(needsServerImport('<kml>', many), true)
+  // полигоны вместе с точками — обычный файл геометрии, разбираем на клиенте
+  assert.equal(needsServerImport('<kml>', { ...many, points: [{ lon: 37, lat: 55 }] }), false)
+})
+
+test('подписи для попапов: тип зоны, тип и высота препятствия, полоса высот', () => {
+  assert.equal(zoneTypeLabel('prohibited'), 'запретная зона')
+  assert.equal(zoneTypeLabel(undefined), 'ограничение')
+  assert.equal(zoneTypeLabel('нечто'), 'ограничение')
+  assert.equal(obstacleTypeLabel('COMMUNICATION_TOWER'), 'вышка связи')
+  assert.equal(obstacleTypeLabel('SKI_JUMP'), 'ski jump')
+  assert.equal(obstacleTypeLabel(''), 'препятствие')
+  assert.equal(obstacleTopLabel(77.1, 'AGL'), '77,1 м над землёй')
+  assert.equal(obstacleTopLabel(212, 'AMSL'), '212 м над уровнем моря')
+  assert.equal(obstacleTopLabel(undefined, 'AGL'), 'высота не задана')
+  assert.equal(
+    altBandLabel({ lower_m: 0, lower_ref: 'GND', upper_m: 500, upper_ref: 'AMSL', raw: 'От земли до 500 м AMSL' }),
+    'От земли до 500 м AMSL',
+  )
+  assert.equal(altBandLabel({ lower_m: 800, lower_ref: 'AMSL', upper_m: null, upper_ref: 'AMSL' }), 'от 800 м AMSL и выше')
+  assert.equal(altBandLabel(undefined), 'высоты не заданы')
+})
+
+test('вырожденная дыра не рушит полигон, а отбрасывается', () => {
+  const outer = square(37, 55, 1).coordinates[0]
+  const p = normalizePolygonDropHoles([outer, [[37.1, 55.1], [37.1, 55.1], [37.1, 55.1]], square(37.2, 55.2).coordinates[0]])
+  assert.notEqual(typeof p, 'string')
+  assert.equal((p as Polygon).coordinates.length, 2) // внешний контур и одна годная дыра
+  // с битым внешним контуром полигона нет
+  assert.equal(typeof normalizePolygonDropHoles([[[0, 0], [1, 1]]]), 'string')
+  assert.equal(typeof normalizePolygonDropHoles([]), 'string')
 })
