@@ -219,3 +219,23 @@ def test_temporary_restriction_outside_window_is_skipped():
     res = plan(PlanRequest(**req))  # ограничение начнётся через неделю — работам не мешает
     assert res.airspace.restrictions_applied == 0
     assert "не действует в окно работ" in res.restrictions[0]["properties"]["skip_reason"]
+
+
+# ------------------------------------------------- потолок 150 м над рельефом
+def test_fixed_wing_level_respects_ceiling_over_relief():
+    """Самолёт идёт на постоянном эшелоне, поэтому над низинами он выше, чем над холмами.
+    При заданном потолке (150 м без согласования, ПП РФ № 138) эшелон опускается так, чтобы
+    высота над низинами в потолок укладывалась."""
+    data = {k: v for k, v in json.loads(MOSCOW.read_text(encoding="utf-8")).items() if not k.startswith("_")}
+    data["requirements"] = {**data.get("requirements", {}), "altitude_ceiling_m": 150.0}
+    res = plan(PlanRequest(**data))
+    assert res.terrain is not None, "тест требует рельефа (тайлы Copernicus DEM в кэше)"
+    plane = next(d for d in res.drones if d.model == "geoscan_201")
+    assert plane.params.altitude_agl_m < 150.0  # эшелон опущен на перепад рельефа
+    worst = 0.0
+    for s in plane.sorties:
+        for leg in s.legs:
+            if leg.kind in ("survey", "tie") and leg.alt_amsl:
+                # высота над землёй = эшелон − рельеф; рельеф под галсами не ниже минимума области
+                worst = max(worst, max(leg.alt_amsl) - res.airspace.ground_min_m)
+    assert worst <= 151.0, f"над низинами {worst:.0f} м — выше потолка 150 м"

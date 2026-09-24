@@ -56,7 +56,7 @@ from .schemas import (
     Summary,
     TerrainInfo,
 )
-from .sensors import SurveyInfeasible, SurveyParams, survey_params
+from .sensors import SurveyInfeasible, SurveyParams, SurveyRequirements, survey_params
 from .wind import Wind, ground_speed
 
 # Минимальный вес времени работ в критерии «налёт» (w = 0): разрешает почти равные по налёту
@@ -272,10 +272,12 @@ class Planner:
         t = Terrain((minx - 0.02, miny - 0.02, maxx + 0.02, maxy + 0.02))
         if not t.available:
             return None, None
-        n = 5
-        pts = [(minx + (maxx - minx) * i / (n - 1), miny + (maxy - miny) * j / (n - 1))
-               for i in range(n) for j in range(n)]
-        h = [float(v) for v in t.heights(pts) if v == v]
+        n = 15
+        grid = [(minx + (maxx - minx) * i / (n - 1), miny + (maxy - miny) * j / (n - 1))
+                for i in range(n) for j in range(n)]
+        # точки внутри области: перепад по описанному прямоугольнику был бы завышен
+        inside = [p for p in grid if survey_wgs.covers(Point(p))]
+        h = [float(v) for v in t.heights(inside or grid) if v == v]
         return (min(h), max(h)) if h else (None, None)
 
     def _airspace(self, area: BaseGeometry, survey_wgs: BaseGeometry) -> AirspaceInfo:
@@ -368,6 +370,44 @@ class Planner:
             ground_max_m=None if g_max is None else round(g_max, 1),
         )
 
+    def _level_flight_requirements(
+        self, drone: DroneModel, payload: Payload, req: SurveyRequirements, drone_id: str
+    ) -> SurveyRequirements:
+        """Требования к съёмке для самолёта с поправкой на рельеф.
+
+        Самолёт идёт на постоянном эшелоне, поэтому над низинами он выше, чем над холмами, на
+        перепад высот области Δ. Если планировать съёмку «по холмам», над низинами высота
+        оказывается Δ выше заданной: GSD хуже требуемого, а при Δ больше запаса — ещё и выше
+        законного потолка 150 м (ПП РФ № 138 требует согласования выше). Поэтому эшелон
+        опускаем: планируем высоту h = min(h_GSD, потолок) − Δ, считая по ней и расстояние между
+        галсами (над холмами полоса захвата самая узкая — перекрытие выдерживается всюду).
+        Над низинами высота тогда ровно min(h_GSD, потолок), то есть GSD и потолок соблюдены.
+        """
+        a = self.airspace
+        if a is None or a.ground_min_m is None or a.ground_max_m is None:
+            return req
+        delta = a.ground_max_m - a.ground_min_m
+        if delta < 1.0:
+            return req
+        try:
+            h_gsd = survey_params(drone, payload, req).altitude_agl_m
+        except SurveyInfeasible:
+            return req
+        ceiling = req.altitude_ceiling_m
+        target = min(h_gsd, ceiling if ceiling is not None else math.inf) - delta
+        if target >= h_gsd - 0.5:
+            return req
+        if target < drone.min_alt_agl_m:
+            # перепад рельефа больше запаса по высоте: эшелон опустить некуда. Предупреждение
+            # выдаст _apply_terrain — там видно фактическое превышение на галсах
+            return req
+        self.warnings.append(
+            f"{drone_id}: перепад рельефа {delta:.0f} м — эшелон съёмки опущен до {target:.0f} м над "
+            f"холмами, чтобы над низинами высота не превысила "
+            f"{min(h_gsd, ceiling if ceiling is not None else h_gsd):.0f} м (галсов больше)"
+        )
+        return req.model_copy(update={"altitude_m": target})
+
     # ------------------------------------------------------------------ борта
     def _candidates(self) -> list[Candidate]:
         out: list[Candidate] = []
@@ -394,12 +434,15 @@ class Planner:
                     ExcludedDrone(drone_id=inst.id, reason=f"{drone.name}: нет нагрузки для съёмки «{req.survey_type}»")
                 )
                 continue
+            requirements = req.requirements
+            if drone.type == "fixed_wing":
+                requirements = self._level_flight_requirements(drone, payload, requirements, inst.id)
             try:
                 # высота съёмки от скорости не зависит — по ней пересчитываем ветер на рабочую высоту
-                h = survey_params(drone, payload, req.requirements).altitude_agl_m
+                h = survey_params(drone, payload, requirements).altitude_agl_m
                 wind = req.wind.at(h)
                 # против ветра нужна путевая скорость ≥ ~2 м/с
-                params = survey_params(drone, payload, req.requirements, min_speed=wind.speed_ms + 2.0)
+                params = survey_params(drone, payload, requirements, min_speed=wind.speed_ms + 2.0)
             except SurveyInfeasible as e:
                 self.excluded.append(ExcludedDrone(drone_id=inst.id, reason=str(e)))
                 continue
@@ -1089,14 +1132,30 @@ class Planner:
         out: dict[tuple[int, int], tuple[list, list]] = {}
         base_ground = self._ground(terrain, [self.bases[r.base_id]])[0]
         worst_agl = 0.0
+        ceiling = self.req.requirements.altitude_ceiling_m
         for s in r.sorties:
             if r.cand.drone.type == "fixed_wing":
-                all_pts = [p for leg in s.legs for p in self._dense(leg.points, 100.0)]
-                level = max(self._ground(terrain, all_pts) + [base_ground]) + agl
-                survey_pts = [p for leg in s.legs if leg.kind in ("survey", "tie") for p in self._dense(leg.points, 100.0)]
+                # Два эшелона на вылет: над галсами и на перелёте. Один общий эшелон означал бы,
+                # что высокий рельеф по дороге к базе задирает высоту над галсами и портит GSD.
+                # Эшелон над галсами держится над высшей точкой снимаемого участка; если из-за
+                # низин он выходит за потолок, опускаем его (полоса захвата чуть уже — перекрытие
+                # выдерживает).
+                survey_pts = [p for leg in s.legs if leg.kind in ("survey", "tie")
+                              for p in self._dense(leg.points, 100.0)]
+                other_pts = [p for leg in s.legs if leg.kind not in ("survey", "tie")
+                             for p in self._dense(leg.points, 100.0)]
+                transit_level = max(self._ground(terrain, other_pts or survey_pts) + [base_ground]) + agl
+                survey_level = transit_level
                 if survey_pts:
-                    worst_agl = max(worst_agl, level - min(self._ground(terrain, survey_pts)))
+                    g = self._ground(terrain, survey_pts)
+                    survey_level = max(g) + agl
+                    if ceiling is not None:
+                        # не ниже минимальной высоты над высшей точкой участка
+                        survey_level = max(min(survey_level, min(g) + ceiling),
+                                           max(g) + r.cand.drone.min_alt_agl_m)
+                    worst_agl = max(worst_agl, survey_level - min(g))
                 for i, leg in enumerate(s.legs):
+                    level = survey_level if leg.kind in ("survey", "tie") else transit_level
                     alt = []
                     for k, pt in enumerate(leg.points):
                         if _on_ground(leg.kind, k, len(leg.points)):
@@ -1119,14 +1178,19 @@ class Planner:
                 else:
                     level = max(self._ground(terrain, self._dense(leg.points, 100.0))) + agl
                     out[(s.index, i)] = (leg.points, [level] * len(leg.points))
-        if worst_agl > agl * 1.1:
-            # самолёт держит эшелон над высшей точкой рельефа — над низинами он выше заданной высоты
-            p = r.cand.params
+        # Самолёт держит эшелон над высшей точкой участка, поэтому над низинами он выше заданной
+        # высоты. Предупреждаем, только если это нарушает требования: GSD хуже заданного или
+        # высота выше потолка (для полётов без согласования — 150 м, ПП РФ № 138).
+        p = r.cand.params
+        req_gsd = self.req.requirements.gsd_cm
+        worst_gsd = p.gsd_cm * worst_agl / agl if (p.gsd_cm and agl > 0) else None
+        gsd_bad = worst_gsd is not None and req_gsd is not None and worst_gsd > req_gsd * 1.02
+        alt_bad = ceiling is not None and worst_agl > ceiling + 1.0
+        if gsd_bad or alt_bad:
             msg = f"{r.cand.instance_id}: над низинами высота до {worst_agl:.0f} м над землёй вместо {agl:.0f} м"
-            if p.gsd_cm:
-                msg += f", GSD до {p.gsd_cm * worst_agl / agl:.1f} см вместо {p.gsd_cm:.1f}"
-            ceiling = self.req.requirements.altitude_ceiling_m
-            if ceiling is not None and worst_agl > ceiling:
+            if gsd_bad:
+                msg += f", GSD до {worst_gsd:.1f} см вместо заданных {req_gsd:.1f}"
+            if alt_bad:
                 msg += f"; выше потолка {ceiling:.0f} м"
             self.warnings.append(msg + " — разбейте область по высотам рельефа или используйте мультиротор")
         return out

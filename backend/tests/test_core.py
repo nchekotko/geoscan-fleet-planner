@@ -488,15 +488,19 @@ def test_terrain_following_keeps_agl():
 
 
 @pytest.mark.skipif(not HAS_MOSCOW_DEM, reason="нет тайла Copernicus DEM в кэше")
-def test_fixed_wing_flies_constant_level_not_below_start():
+def test_fixed_wing_flies_two_levels_per_sortie():
+    """У самолёта на вылет два эшелона: над галсами (по высшей точке участка) и на перелёте
+    (по рельефу дороги, не ниже точки старта). Внутри каждой группы участков высота постоянна."""
     res = plan(load_req(time_weight=0.0))
     d = res.drones[0]
     assert d.model == "geoscan_201"
     for s in d.sorties:
         takeoff_ground = s.legs[0].alt_amsl[0]
-        levels = {a for l in s.legs if l.kind not in ("takeoff", "landing") for a in l.alt_amsl}
-        assert len(levels) == 1
-        assert levels.pop() >= takeoff_ground + d.params.altitude_agl_m
+        survey = {a for l in s.legs if l.kind in ("survey", "tie") for a in l.alt_amsl}
+        transit = {a for l in s.legs if l.kind in ("transit", "return") for a in l.alt_amsl}
+        assert len(survey) == 1 and len(transit) == 1
+        assert transit.pop() >= takeoff_ground + d.params.altitude_agl_m
+        assert survey.pop() >= takeoff_ground  # эшелон съёмки не ниже уровня ВПП
 
 
 def test_no_terrain_gives_warning(monkeypatch):

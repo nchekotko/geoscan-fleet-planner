@@ -5,8 +5,11 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import uuid
+import xml.etree.ElementTree as ET
+from typing import Literal
 from pathlib import Path
 from urllib.parse import quote
 
@@ -16,9 +19,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from planner.advisor import advise
+from planner.geodata import parse_obstacles_kml, parse_task_kml, parse_zones_kml
 from planner.export import drone_geojson, drone_kml, plan_zip
 from planner.fleet import load_fleet
 from planner.pareto import pareto_front
@@ -176,6 +180,45 @@ def make_advice(req: AdviceRequest) -> dict:
         raise HTTPException(422, f"подсказка не построена: {e}") from e
     finally:
         _pareto_lock.release()
+
+
+class ImportRequest(BaseModel):
+    """Файл заказчика для разбора: содержимое KML и что из него читать."""
+
+    kml: str = Field(min_length=1, max_length=64_000_000)
+    kind: Literal["auto", "zones", "obstacles", "task"] = "auto"
+
+
+@app.post("/api/import/kml")
+def import_kml(req: ImportRequest) -> dict:
+    """Разбор KML заказчика в наш формат: зоны ограничений (с высотами и временем), высотные
+    препятствия (3D-примитивы) или полигоны задания на съёмку. kind = auto — определяем сами."""
+    with tempfile.NamedTemporaryFile("w", suffix=".kml", encoding="utf-8", delete=False) as fh:
+        fh.write(req.kml)
+        path = fh.name
+    try:
+        kind = req.kind
+        if kind == "auto":
+            kind = _guess_kml_kind(req.kml)
+        parse = {"zones": parse_zones_kml, "obstacles": parse_obstacles_kml, "task": parse_task_kml}[kind]
+        features = parse(path)
+    except (ET.ParseError, ValueError, KeyError) as e:
+        raise HTTPException(422, f"KML не разобран: {e}") from e
+    finally:
+        os.unlink(path)
+    if not features:
+        raise HTTPException(422, "в файле нет подходящих объектов")
+    return {"kind": kind, "features": features}
+
+
+def _guess_kml_kind(text: str) -> str:
+    """Что за файл: зоны (ExtendedData с высотами), препятствия (высота в координатах и extrude)
+    или задание на съёмку (просто полигоны)."""
+    if "Altitudes" in text or "запретная" in text or "ограничение" in text:
+        return "zones"
+    if "<extrude>" in text or "relativeToGround" in text:
+        return "obstacles"
+    return "task"
 
 
 @app.get("/api/geodata")
