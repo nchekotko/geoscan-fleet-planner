@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
+from datetime import timedelta
 
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
@@ -35,6 +36,7 @@ from .coverage import (
 from .energy import check_wind, usable_flight_time_s
 from .fleet import DroneModel, Payload, load_fleet
 from .geo import LocalFrame
+from .geodata import obstacle_from_feature, restriction_from_feature
 from .mission import Sortie, SortieBuilder, order_passes, schedule
 from .terrain import TERRAIN_ATTRIBUTION, Terrain
 from .turns import turn_overshoot
@@ -43,6 +45,7 @@ from .mission import FIXED_WING_LANDING_S, FIXED_WING_TAKEOFF_S, LAUNCH_INTERVAL
 from .separation import H_MIN_M, closest_approach, track
 from .partition import split_by_fractions, strip_axis_position
 from .schemas import (
+    AirspaceInfo,
     DronePlanOut,
     ExcludedDrone,
     LegOut,
@@ -82,6 +85,12 @@ TRANSIT_LEVEL_STEP_M = 20.0
 MAX_ORDER_SEARCH_DRONES = 6
 MAX_ORDERS_LARGE_FLEET = 4
 TRANSIT_KINDS = ("transit", "return")
+# запас вокруг области и баз, в котором зоны и препятствия ещё могут помешать
+AIRSPACE_MARGIN_M = 2_000.0
+# больше запретных зон граф видимости не переварит (обход строится по вершинам)
+MAX_BLOCKING_OBSTACLES = 200
+# предел высоты для полётов без согласования, ПП РФ № 138 (приложение, п. 52.1)
+LEGAL_ALT_LIMIT_M = 150.0
 
 
 def round_trip_s_per_m(v: float, wind: Wind, steps: int = 72) -> float:
@@ -199,6 +208,8 @@ class Planner:
         else:
             self.allowed = None
         self.nfz = [f.to_local(shape(z)) for z in req.no_fly_zones]
+        # зоны ограничений и высотные препятствия (данные о воздушном пространстве)
+        self.airspace = self._airspace(area, survey_wgs)
         if self.nfz:
             blocked = unary_union([z.buffer(req.nfz_buffer_m) for z in self.nfz])
             area = area.difference(blocked)
@@ -227,6 +238,134 @@ class Planner:
                 "ни один борт не может выполнить съёмку этого типа в заданных условиях"
                 + (f": {reasons}" if reasons else "")
             )
+
+    # -------------------------------------------------- воздушное пространство
+    def _alt_span_agl(self) -> tuple[float, float]:
+        """Полоса высот работ над землёй: от самой низкой съёмки в парке до самой высокой
+        плюс эшелоны перелёта. По ней отбираются зоны ограничений: зона «от 800 м AMSL
+        до FL90» съёмке на 150 м над землёй не мешает."""
+        alts: list[float] = []
+        for inst in self.req.drones:
+            drone = self.fleet.drones.get(inst.model)
+            if drone is None:
+                continue
+            for pid in ([inst.payload] if inst.payload else drone.payloads):
+                payload = self.fleet.payloads.get(pid or "")
+                if payload is None or self.req.survey_type not in payload.survey_types:
+                    continue
+                try:
+                    alts.append(survey_params(drone, payload, self.req.requirements).altitude_agl_m)
+                except SurveyInfeasible:
+                    continue
+        if not alts:
+            alts = [self.req.requirements.altitude_ceiling_m or LEGAL_ALT_LIMIT_M]
+        levels = TRANSIT_LEVEL_STEP_M * max(len(self.req.drones) - 1, 0)
+        return min(alts), max(alts) + levels
+
+    def _ground_band(self, survey_wgs: BaseGeometry) -> tuple[float | None, float | None]:
+        """Минимальная и максимальная высота земли над уровнем моря в области — нужна, чтобы
+        перевести границы зон и верх препятствий из AMSL в высоту над землёй."""
+        if not self.req.use_terrain:
+            return None, None
+        minx, miny, maxx, maxy = survey_wgs.bounds
+        t = Terrain((minx - 0.02, miny - 0.02, maxx + 0.02, maxy + 0.02))
+        if not t.available:
+            return None, None
+        n = 5
+        pts = [(minx + (maxx - minx) * i / (n - 1), miny + (maxy - miny) * j / (n - 1))
+               for i in range(n) for j in range(n)]
+        h = [float(v) for v in t.heights(pts) if v == v]
+        return (min(h), max(h)) if h else (None, None)
+
+    def _airspace(self, area: BaseGeometry, survey_wgs: BaseGeometry) -> AirspaceInfo:
+        """Отбор зон ограничений и препятствий, которые действительно мешают работам,
+        и добавление их в список запретных зон."""
+        req, f = self.req, self.frame
+        alt_min, alt_top = self._alt_span_agl()
+        g_min, g_max = self._ground_band(survey_wgs)
+        gmin, gmax = (g_min or 0.0), (g_max or 0.0)
+        t0 = req.mission_start
+        t1 = t0 + timedelta(hours=req.mission_window_h) if t0 is not None else None
+        # коридор работ: область и базы с запасом — далёкие зоны и препятствия не мешают
+        pts = [Point(f.lonlat_to_xy(b.lon, b.lat)) for b in req.bases]
+        envelope = unary_union([area, *pts]).convex_hull.buffer(AIRSPACE_MARGIN_M)
+
+        self.restrictions: list[dict] = []
+        applied = 0
+        for i, feat in enumerate(req.restrictions):
+            r = restriction_from_feature(feat)
+            try:
+                geom = _polys(make_valid(f.to_local(shape(r.geometry))))
+            except (GEOSException, ValueError):
+                continue
+            if geom.is_empty or not geom.intersects(envelope):
+                continue
+            lo, hi = r.band.agl_span(gmin, gmax)
+            by_alt = hi > 0.0 and lo <= alt_top
+            by_time = r.window.active(t0, t1)
+            props = {**(feat.get("properties") or {}), "applies": bool(by_alt and by_time)}
+            if not by_alt:
+                props["skip_reason"] = (f"полоса высот {lo:.0f}–{hi:.0f} м над землёй выше работ "
+                                       f"(до {alt_top:.0f} м)")
+            elif not by_time:
+                props["skip_reason"] = "не действует в окно работ"
+            self.restrictions.append({"type": "Feature", "geometry": r.geometry, "properties": props})
+            if by_alt and by_time:
+                self.nfz.append(geom)
+                applied += 1
+        if req.restrictions:
+            self.warnings.append(
+                f"зоны ограничений: в расчёт вошло {applied} из {len(req.restrictions)} "
+                f"(полоса высот работ 0–{alt_top:.0f} м над землёй"
+                + (f", окно работ {req.mission_window_h:.0f} ч от {t0:%d.%m %H:%M}" if t0 is not None else "")
+                + ")"
+            )
+            if g_min is None and any(
+                    (x.get("properties", {}).get("alt") or {}).get("upper_ref") == "AMSL" for x in req.restrictions):
+                self.warnings.append(
+                    "границы зон заданы над уровнем моря, а рельеф выключен — высота земли принята за 0 м, "
+                    "часть зон могла попасть в расчёт напрасно"
+                )
+
+        self.obstacles: list[dict] = []
+        blocking: list[BaseGeometry] = []
+        for feat in req.obstacles:
+            o = obstacle_from_feature(feat)
+            top_agl = o.top_agl(gmin)  # AMSL → над землёй по самой низкой земле области (запас)
+            if top_agl + req.obstacle_clearance_m <= alt_min:
+                continue  # перелетаем сверху, не теряя GSD
+            try:
+                geom = f.to_local(shape(o.geometry))
+            except (GEOSException, ValueError):
+                continue
+            if geom.is_empty or not geom.intersects(envelope):
+                continue
+            # обход: горизонтальный зазор до препятствия (буфер NFZ добавится сверху)
+            blocking.append(geom.buffer(max(req.obstacle_buffer_m - req.nfz_buffer_m, 0.1)))
+            self.obstacles.append({"type": "Feature", "geometry": o.geometry,
+                                   "properties": {**(feat.get("properties") or {}),
+                                                  "top_agl_m": round(top_agl, 1), "blocks": True}})
+        if blocking:
+            if len(blocking) > MAX_BLOCKING_OBSTACLES:
+                # столько препятствий граф видимости не выдержит: оставляем те, что в области
+                near = [g for g in blocking if g.intersects(area)]
+                self.warnings.append(
+                    f"высотных препятствий в коридоре работ {len(blocking)} — в обход маршрутов взяты "
+                    f"{len(near)}, попадающие в область съёмки"
+                )
+                blocking = near[:MAX_BLOCKING_OBSTACLES]
+            self.nfz += blocking
+            self.warnings.append(
+                f"высотные препятствия: {len(blocking)} из {len(req.obstacles)} выше высоты съёмки "
+                f"({alt_min:.0f} м) с зазором {req.obstacle_clearance_m:.0f} м — облетаются как запретные зоны"
+            )
+        return AirspaceInfo(
+            restrictions_total=len(req.restrictions), restrictions_applied=applied,
+            obstacles_total=len(req.obstacles), obstacles_blocking=len(blocking),
+            alt_band_agl_m=[round(alt_min, 1), round(alt_top, 1)],
+            ground_min_m=None if g_min is None else round(g_min, 1),
+            ground_max_m=None if g_max is None else round(g_max, 1),
+        )
 
     # ------------------------------------------------------------------ борта
     def _candidates(self) -> list[Candidate]:
@@ -1101,6 +1240,9 @@ class Planner:
             no_fly_zones=self.req.no_fly_zones,
             allowed_area=self.req.allowed_area,
             terrain=self._terrain_info(terrain),
+            restrictions=self.restrictions,
+            obstacles=self.obstacles,
+            airspace=self.airspace,
         )
 
     def _transit_levels(self, results: list[DroneResult]) -> dict[str, float]:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -18,6 +19,11 @@ MAX_VERTICES = 20_000
 MAX_AREA_KM2 = 1_000.0
 MAX_DRONES = 40
 MAX_NFZ = 200
+# зоны ограничений и препятствия приходят выгрузками (в примере заказчика — 341 зона
+# и 5162 препятствия на регион), поэтому лимиты выше: фильтр по высотам и области отсеет лишнее
+MAX_RESTRICTIONS = 5_000
+MAX_OBSTACLES = 100_000
+OBSTACLE_GEOMETRIES = ("Polygon", "MultiPolygon", "LineString", "MultiLineString", "Point")
 
 
 def _polygon_geojson(g: Any, what: str) -> dict[str, Any]:
@@ -51,6 +57,28 @@ def _polygon_geojson(g: Any, what: str) -> dict[str, Any]:
     if what == "область съёмки" and km2 > MAX_AREA_KM2:
         raise ValueError(f"{what}: {km2:.0f} км² — больше {MAX_AREA_KM2:.0f} км²; разбейте на части")
     return mapping(geom)
+
+
+def _feature(f: Any, what: str, types: tuple[str, ...]) -> dict[str, Any]:
+    """Проверка Feature нашего формата (или «голой» геометрии): тип геометрии из types,
+    координаты в диапазоне WGS84. properties проходят как есть — их разбирает geodata."""
+    if not isinstance(f, dict):
+        raise ValueError(f"{what}: нужен GeoJSON Feature или геометрия")
+    geom = f.get("geometry") if f.get("type") == "Feature" else f
+    if not isinstance(geom, dict) or geom.get("type") not in types:
+        raise ValueError(f"{what}: геометрия должна быть {' | '.join(types)}")
+    try:
+        g = shape(geom)
+    except Exception as e:  # noqa: BLE001 — shapely бросает разные исключения на битый GeoJSON
+        raise ValueError(f"{what}: некорректные координаты GeoJSON ({e})") from None
+    if g.is_empty:
+        raise ValueError(f"{what}: пустая геометрия")
+    minx, miny, maxx, maxy = g.bounds
+    if not all(math.isfinite(v) for v in (minx, miny, maxx, maxy)):
+        raise ValueError(f"{what}: координаты должны быть конечными числами")
+    if not (-180 <= minx and maxx <= 180 and -90 <= miny and maxy <= 90):
+        raise ValueError(f"{what}: координаты вне диапазона долгота ±180°, широта ±90°")
+    return f if f.get("type") == "Feature" else {"type": "Feature", "geometry": geom, "properties": {}}
 
 
 class Site(BaseModel):
@@ -88,6 +116,27 @@ class PlanRequest(BaseModel):
     reserve: float = Field(0.2, ge=0.0, le=0.6)
     nfz_buffer_m: float = Field(30.0, ge=0.0, le=10_000.0)
     use_terrain: bool = True  # рельеф Copernicus DEM GLO-30
+    # Зоны ограничений в нашем формате (docs/data_formats.md): с диапазоном высот и временем
+    # действия. Мешает только та зона, чья полоса высот пересекает высоты работ и которая
+    # действует в окно работ; остальные показываются справочно.
+    restrictions: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_RESTRICTIONS)
+    # Высотные препятствия (мачты, трубы, ЛЭП, лес): запретны те, чей верх с зазором выше
+    # высоты съёмки — их не перелететь, не потеряв заданный GSD.
+    obstacles: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_OBSTACLES)
+    obstacle_clearance_m: float = Field(30.0, ge=0.0, le=1_000.0)  # вертикальный зазор над препятствием
+    obstacle_buffer_m: float = Field(50.0, ge=0.0, le=10_000.0)    # горизонтальный обход препятствия
+    mission_start: datetime | None = None          # начало работ (для временных ограничений)
+    mission_window_h: float = Field(12.0, gt=0.0, le=168.0)  # окно, в котором проверяется действие зон
+
+    @field_validator("restrictions")
+    @classmethod
+    def _check_restrictions(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [_feature(z, f"зона ограничения {i + 1}", ("Polygon", "MultiPolygon")) for i, z in enumerate(v)]
+
+    @field_validator("obstacles")
+    @classmethod
+    def _check_obstacles(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [_feature(o, f"препятствие {i + 1}", OBSTACLE_GEOMETRIES) for i, o in enumerate(v)]
 
     @field_validator("survey_area")
     @classmethod
@@ -178,6 +227,19 @@ class Summary(BaseModel):
     separation_conflicts: int = 0
 
 
+class AirspaceInfo(BaseModel):
+    """Что из данных о воздушном пространстве попало в расчёт."""
+
+    restrictions_total: int = 0
+    restrictions_applied: int = 0
+    obstacles_total: int = 0
+    obstacles_blocking: int = 0
+    # полоса высот работ над землёй, по которой отбирались зоны
+    alt_band_agl_m: list[float] = Field(default_factory=list)
+    ground_min_m: float | None = None
+    ground_max_m: float | None = None
+
+
 class ExcludedDrone(BaseModel):
     drone_id: str
     reason: str
@@ -196,3 +258,7 @@ class PlanResponse(BaseModel):
     no_fly_zones: list[dict[str, Any]] = Field(default_factory=list)
     allowed_area: dict[str, Any] | None = None
     terrain: TerrainInfo | None = None
+    # зоны ограничений и препятствия, попавшие в расчёт (Feature нашего формата)
+    restrictions: list[dict[str, Any]] = Field(default_factory=list)
+    obstacles: list[dict[str, Any]] = Field(default_factory=list)
+    airspace: AirspaceInfo | None = None
