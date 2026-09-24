@@ -16,7 +16,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import Field
 
+from planner.advisor import advise
 from planner.export import drone_geojson, drone_kml, plan_zip
 from planner.fleet import load_fleet
 from planner.pareto import pareto_front
@@ -24,6 +26,7 @@ from planner.planner import PlanningError, plan
 from planner.schemas import PlanRequest, PlanResponse
 
 SCENARIOS = Path(__file__).resolve().parent.parent / "data" / "scenarios"
+GEODATA = Path(__file__).resolve().parent.parent / "data" / "geodata"
 log = logging.getLogger("geoscan.api")
 
 app = FastAPI(title="Geoscan Fleet Planner", version="0.1.0")
@@ -149,6 +152,55 @@ def make_pareto(req: PlanRequest) -> list[dict]:
         _plans[plan_id] = p
         out.append({"plan_id": plan_id, **p.model_dump()})
     return out
+
+
+class AdviceRequest(PlanRequest):
+    """Запрос к советнику: тот же план плюс ограничения пользователя."""
+
+    deadline_s: float | None = Field(None, gt=0.0)   # срок выполнения работ, с
+    max_drones: int | None = Field(None, ge=1)       # сколько бортов разрешено занять
+
+
+@app.post("/api/advise")
+def make_advice(req: AdviceRequest) -> dict:
+    """Подсказки по ограничениям: выполнимо ли задание, сколько бортов нужно к сроку,
+    сколько времени займут работы заданным числом бортов."""
+    if not _pareto_lock.acquire(timeout=120):
+        raise HTTPException(503, "сервис занят другим расчётом — повторите через минуту")
+    try:
+        plan_req = PlanRequest(**req.model_dump(exclude={"deadline_s", "max_drones"}))
+        return advise(plan_req, deadline_s=req.deadline_s, max_drones=req.max_drones).model_dump()
+    except PlanningError as e:
+        raise HTTPException(422, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(422, f"подсказка не построена: {e}") from e
+    finally:
+        _pareto_lock.release()
+
+
+@app.get("/api/geodata")
+def list_geodata() -> list[dict]:
+    """Выгрузки данных о воздушном пространстве, лежащие рядом с сервисом."""
+    out = []
+    for p in sorted(GEODATA.glob("*.geojson")):
+        try:
+            head = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        out.append({"name": p.stem, "title": head.get("name", p.stem),
+                    "features": len(head.get("features", [])), "size_kb": round(p.stat().st_size / 1024)})
+    return out
+
+
+@app.get("/api/geodata/{name}")
+def get_geodata(name: str) -> Response:
+    """Выгрузка целиком (GeoJSON нашего формата): зоны ограничений, препятствия, задание."""
+    if not re.fullmatch(r"[a-z0-9_]+", name):
+        raise HTTPException(404, "нет такой выгрузки")
+    path = GEODATA / f"{name}.geojson"
+    if not path.exists():
+        raise HTTPException(404, "нет такой выгрузки")
+    return Response(path.read_bytes(), media_type="application/geo+json")
 
 
 def _get(plan_id: str) -> PlanResponse:

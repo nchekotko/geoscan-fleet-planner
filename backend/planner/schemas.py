@@ -95,6 +95,9 @@ class DroneInstance(BaseModel):
     model: str                      # ключ из fleet.yaml
     payload: str | None = None      # если не задано — первая подходящая нагрузка
     base_id: str | None = None      # если не задано — ближайшая к области база
+    # наработка борта с прошлого ТО: нормативы — 80 полётов (201, 401) или 160 часов (801)
+    flights_done: int = Field(0, ge=0)
+    hours_done: float = Field(0.0, ge=0.0)
 
 
 class PlanRequest(BaseModel):
@@ -204,6 +207,23 @@ class DronePlanOut(BaseModel):
     flight_time_s: float
     finish_s: float
     transit_alt_agl_m: float = 0.0  # эшелон перелётов (взлёт, транзит, возврат)
+    maintenance: MaintenanceOut | None = None
+
+
+class MaintenanceOut(BaseModel):
+    """Наработка борта до техобслуживания. Нормативы ГК «Геоскан»: 201 и 401 — каждые
+    80 полётов, 801 и Gemini — каждые 160 часов полёта."""
+
+    interval_flights: int | None = None
+    interval_hours: float | None = None
+    flights_before: int = 0
+    hours_before: float = 0.0
+    flights_after: int = 0
+    hours_after: float = 0.0
+    # остаток ресурса после задания (в полётах или часах — по своему нормативу)
+    remaining_flights: int | None = None
+    remaining_hours: float | None = None
+    due: bool = False  # ТО потребуется до конца задания
 
 
 class TerrainInfo(BaseModel):
@@ -243,6 +263,38 @@ class AirspaceInfo(BaseModel):
 class ExcludedDrone(BaseModel):
     drone_id: str
     reason: str
+
+
+class AdviceOption(BaseModel):
+    """Точка кривой «время работ от числа бортов»."""
+
+    drones: int
+    drone_ids: list[str] = Field(default_factory=list)
+    makespan_s: float | None = None
+    total_flight_s: float | None = None
+    sorties: int | None = None
+    coverage_pct: float | None = None
+    # лучшее время работ, достижимое этим числом бортов или меньшим (кривая не монотонна:
+    # лишний борт с далёкой базой может затянуть работы)
+    best_makespan_s: float | None = None
+    feasible: bool = True
+    reason: str = ""
+
+
+class AdviceResponse(BaseModel):
+    """Подсказки по ограничениям: выполнимо ли задание, сколько бортов нужно к сроку,
+    сколько времени займут работы заданным числом бортов."""
+
+    options: list[AdviceOption]
+    deadline_s: float | None = None
+    feasible: bool | None = None
+    drones_needed: int | None = None
+    drones_needed_ids: list[str] = Field(default_factory=list)
+    best_makespan_s: float | None = None
+    best_drones: int | None = None
+    best_drone_ids: list[str] = Field(default_factory=list)
+    min_total_flight_s: float | None = None
+    message: str = ""
 
 
 class PlanResponse(BaseModel):

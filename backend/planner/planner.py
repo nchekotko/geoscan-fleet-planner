@@ -47,6 +47,7 @@ from .partition import split_by_fractions, strip_axis_position
 from .schemas import (
     AirspaceInfo,
     DronePlanOut,
+    MaintenanceOut,
     ExcludedDrone,
     LegOut,
     PlanRequest,
@@ -1183,6 +1184,7 @@ class Planner:
                     flight_time_s=round(r.flight_s, 1),
                     finish_s=round(r.finish_s, 1),
                     transit_alt_agl_m=round(r.cand.params.altitude_agl_m + off, 1),
+                    maintenance=self._maintenance(r),
                 )
             )
         unused = {c.instance_id for c in self.candidates} - {r.cand.instance_id for r in ev.results}
@@ -1244,6 +1246,40 @@ class Planner:
             obstacles=self.obstacles,
             airspace=self.airspace,
         )
+
+    def _maintenance(self, r: DroneResult) -> MaintenanceOut | None:
+        """Наработка борта до ТО. Норматив («каждые 80 полётов» у 201 и 401, «каждые 160 часов»
+        у мультироторов класса 801) — из ответа экспертов; с ним видно, чем оборачивается
+        суммарный налёт: борт, у которого ресурс кончится посреди работ, нужно менять."""
+        d = r.cand.drone
+        if d.maintenance_flights is None and d.maintenance_hours is None:
+            return None
+        inst = next((x for x in self.req.drones if x.id == r.cand.instance_id), None)
+        f0 = inst.flights_done if inst else 0
+        h0 = inst.hours_done if inst else 0.0
+        flights = len(r.sorties)
+        hours = r.flight_s / 3600.0
+        out = MaintenanceOut(
+            interval_flights=d.maintenance_flights, interval_hours=d.maintenance_hours,
+            flights_before=f0, hours_before=round(h0, 2),
+            flights_after=f0 + flights, hours_after=round(h0 + hours, 2),
+        )
+        if d.maintenance_flights is not None:
+            out.remaining_flights = d.maintenance_flights - out.flights_after
+            out.due = out.remaining_flights < 0
+        if d.maintenance_hours is not None:
+            out.remaining_hours = round(d.maintenance_hours - out.hours_after, 2)
+            out.due = out.due or out.remaining_hours < 0
+        if out.due:
+            limit = (f"{d.maintenance_flights} полётов" if d.maintenance_flights is not None
+                     else f"{d.maintenance_hours:.0f} ч полёта")
+            done = (f"{out.flights_after} полётов" if d.maintenance_flights is not None
+                    else f"{out.hours_after:.1f} ч")
+            self.warnings.append(
+                f"{r.cand.instance_id}: ресурс до ТО кончится в этом задании ({done} при норме {limit}) — "
+                "поставьте подменный борт или отправьте этот на обслуживание"
+            )
+        return out
 
     def _transit_levels(self, results: list[DroneResult]) -> dict[str, float]:
         """Эшелоны перелёта: k-й борт на k·TRANSIT_LEVEL_STEP_M выше высоты съёмки, но не выше

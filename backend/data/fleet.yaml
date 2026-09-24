@@ -8,6 +8,7 @@ sources:
   g801: "Буклет Геоскан 801, с. 3–4 — https://download.geoscan.ru/site-files/801/Geoscan_801.pdf?v2"
   g401: "Руководство Геоскан 401, с. 77, 102, 125–130 — https://download.geoscan.ru/site-files/401/Geoscan_401_Manual.pdf"
   sony_rx1r2: "Sony DSC-RX1RM2: 35 мм, 7952×5304 (паспорт камеры)"
+  to_norms: "Нормативы ТО от экспертов ГК «Геоскан» (ответ в чате задачи 23.09.2026): 201 и 401 — каждые 80 полётов, 501 и 801 — каждые 160 часов полёта, 701 — каждые 100 моточасов"
 
 payloads:
   sony_rx1rm2:
@@ -161,6 +162,7 @@ drones:
     landing: parachute_upwind
     swap_time_min: 20
     payloads: [sony_rx1rm2, pollux]
+    maintenance_flights: 80   # ТО каждые 80 полётов (норматив от экспертов, источник to_norms)
     source: g201
     assumed: [cruise_speed_ms, climb_rate_ms, max_bank_deg, swap_time_min]
   geoscan_gemini:
@@ -181,8 +183,10 @@ drones:
     landing: vertical
     swap_time_min: 10
     payloads: [pf1b, pollux]
+    # для Gemini норматив ТО эксперты не называли — берём как у 801 (тот же класс мультиротора)
+    maintenance_hours: 160
     source: gemini
-    assumed: [cruise_speed_ms, min_alt_agl_m, swap_time_min]
+    assumed: [cruise_speed_ms, min_alt_agl_m, swap_time_min, maintenance_hours]
   geoscan_801:
     name: "Геоскан 801"
     type: multirotor
@@ -200,6 +204,7 @@ drones:
     landing: vertical
     swap_time_min: 10
     payloads: [g801_rgb, g801_thermal]
+    maintenance_hours: 160    # ТО каждые 160 часов полёта (норматив от экспертов, источник to_norms)
     source: g801
     assumed: [cruise_speed_ms, climb_rate_ms, battery_wh, min_alt_agl_m, swap_time_min]
   geoscan_401:
@@ -219,5 +224,6 @@ drones:
     landing: vertical
     swap_time_min: 10
     payloads: [sony_rx1rm3, agm_ms3, alphaair_450, geoshark, gs1]
+    maintenance_flights: 80   # ТО каждые 80 полётов (норматив от экспертов, источник to_norms)
     source: g401
     assumed: [cruise_speed_ms, climb_rate_ms, swap_time_min]

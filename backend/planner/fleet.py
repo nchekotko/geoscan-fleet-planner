@@ -61,6 +61,9 @@ class DroneModel(BaseModel):
     landing: str
     swap_time_min: float
     payloads: list[str]
+    # нормативы ТО: у 201 и 401 — по числу полётов, у мультироторов класса 801 — по часам
+    maintenance_flights: int | None = None
+    maintenance_hours: float | None = None
     source: str = ""
     assumed: list[str] = Field(default_factory=list)
 
