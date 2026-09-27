@@ -22,5 +22,7 @@ pres/template.pptx
 pres/deck.md
 .claude/
 docs/review_*.md
+# документы организаторов и заказчика: в репозиторий не выкладываем
+5. Геоскан.pdf
 sources/geodata/
 sources/ChatExport_*/
