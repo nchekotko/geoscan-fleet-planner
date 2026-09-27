@@ -105,12 +105,15 @@ def fill(shape, paras, size=None, bold_first=False, color=None, bullets=True):
             p.space_before = Pt(opts["space_before"])
 
 
-def title(slide, text, pill_pad=0.62, per_char=0.215):
-    """Заголовок + подгонка ширины «плашки» под длину заголовка."""
+def title(slide, text, pill_pad=0.62, per_char=0.215, pill=True):
+    """Заголовок + подгонка ширины «плашки» под длину заголовка.
+    pill=False — плашку не трогаем: на обязательных слайдах шаблона менять сетку нельзя."""
     ph = shapes_by_ph(slide).get(0)
     if ph is None:
         return
     fill(ph, [text])
+    if not pill:
+        return
     for sh in slide.shapes:
         if (sh.shape_type == 1 and "Скругленный" in sh.name and abs(Emu(sh.top).inches - 0.35) < 0.05
                 and abs(Emu(sh.height).inches - 0.68) < 0.05):
@@ -232,7 +235,7 @@ notes(s, "Суть и уникальность в двух фразах. Пол�
 
 # 3. Состав команды
 s = T[9]
-title(s, "СОСТАВ КОМАНДЫ")
+title(s, "СОСТАВ КОМАНДЫ", pill=False)
 for sh in [find_tb(s, "Имя Фамилия")] + [x for x in text_boxes(s) if x.text_frame.text.strip() == "Имя Фамилия"]:
     fill(sh, ["[Имя Фамилия]"])
 for sh in [x for x in s.shapes if x.has_text_frame and x.text_frame.text.startswith("Роль в команде")]:
@@ -241,7 +244,7 @@ notes(s, "Заполнить карточки участников; лишние
 
 # 4. Работа над задачей
 s = T[10]
-title(s, "КАК МЫ РАБОТАЛИ")
+title(s, "КАК МЫ РАБОТАЛИ", pill=False)
 fill(shapes_by_ph(s)[27], ["[Как собрались, участвовали ли вместе в хакатонах — заполнить]"])
 fill(find_tb(s, "Что вас вдохновило"), [
     "Один борт давно умеют планировать Geoscan Planner и Mission Planner. Распределять работу "
@@ -257,7 +260,7 @@ notes(s, "Первый блок — история команды, заполн�
 # 5. Коротко о решении
 s = T[11]
 ph = shapes_by_ph(s)
-title(s, "КОРОТКО О РЕШЕНИИ")
+title(s, "КОРОТКО О РЕШЕНИИ", pill=False)
 fill(ph[49], ["Техническая суть"])
 fill(ph[38], [
     "Ядро на Python рассчитывает параметры съёмки по ТТХ бортов, строит галсы с учётом ветра, "
@@ -532,4 +535,34 @@ for n, sl in enumerate(S, 1):
     set_slide_number(sl, n)
 
 prs.save(OUT)
+
+# Требование организаторов: обязательные слайды 7–11 остаются строго в исходном дизайне и
+# структуре шаблона. Проверяем, что сетка не поехала: у всех фигур те же имена и геометрия.
+# Исключение — плейсхолдер картинки на титульном: в него и кладут логотип.
+def check_mandatory() -> None:
+    src = list(Presentation(HERE / "template.pptx").slides)
+    out = list(Presentation(OUT).slides)
+    bad = []
+    for pos, tpl_n in enumerate(ORDER, 1):
+        if tpl_n not in MANDATORY:
+            continue
+        if pos != tpl_n:
+            bad.append(f"слайд шаблона {tpl_n} стоит на месте {pos}")
+        t, d = src[tpl_n - 1], out[pos - 1]
+        if t.slide_layout.name != d.slide_layout.name:
+            bad.append(f"слайд {pos}: другой макет")
+        def inv(sl):
+            return {(sh.name, sh.left, sh.top, sh.width, sh.height) for sh in sl.shapes}
+        lost = {x for x in inv(t) - inv(d) if not x[0].startswith("Рисунок")}
+        extra = {x for x in inv(d) - inv(t) if not x[0].startswith("Picture")}
+        for x in lost:
+            bad.append(f"слайд {pos}: фигура «{x[0]}» изменена или удалена")
+        for x in extra:
+            bad.append(f"слайд {pos}: добавлена фигура «{x[0]}»")
+    if bad:
+        raise SystemExit("обязательные слайды отличаются от шаблона: " + "; ".join(bad))
+    print("обязательные слайды 7–11 — как в шаблоне")
+
+
+check_mandatory()
 print("saved", OUT, len(S), "slides")
