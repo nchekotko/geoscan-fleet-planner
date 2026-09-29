@@ -20,6 +20,13 @@ OUT = HERE / "Geoscan_fleet_planner.pptx"
 
 TEAM = "[НАЗВАНИЕ КОМАНДЫ]"
 
+# Состав команды: ФИО, роль, город. Контакты добавятся, когда участники их пришлют.
+MEMBERS = [
+    ("Чекотько Николай Николаевич", "Капитан", "Москва"),
+    ("Ковалев Владислав Олегович", "Аналитик", "Санкт-Петербург"),
+    ("Чекотько Александр Николаевич", "Аналитик-разработчик", "Москва"),
+]
+
 # Порядок слайдов: номера слайдов шаблона (1-based). Слайды 7–11 шаблона обязательны и идут
 # строго в исходном дизайне и на своих местах 7–11 (требование организаторов); остальные —
 # наши, до 7-го и после 11-го.
@@ -224,11 +231,11 @@ fill(find_tb(s, "Что делает"), [
     "работу по разнородному парку и даём выбрать компромисс «время работ — налёт».",
 ])
 fill(find_tb(s, "Капитан"), [
-    "Капитан: [ФИО, специальность]",
-    "Участников: [N] человек",
+    f"Капитан: {MEMBERS[0][0]}",
+    f"Участников: {len(MEMBERS)} человека",
     "Как образовалась команда: [заполнить]",
     "Место работы / учёбы: [заполнить]",
-    "Город и регион: [заполнить]",
+    "Город и регион: Москва и Санкт-Петербург",
 ])
 picture(s, 10, IMG / "demo_wide.jpg")
 notes(s, "Суть и уникальность в двух фразах. Поля в квадратных скобках заполнить данными команды.")
@@ -236,11 +243,22 @@ notes(s, "Суть и уникальность в двух фразах. Пол�
 # 3. Состав команды
 s = T[9]
 title(s, "СОСТАВ КОМАНДЫ", pill=False)
-for sh in [find_tb(s, "Имя Фамилия")] + [x for x in text_boxes(s) if x.text_frame.text.strip() == "Имя Фамилия"]:
-    fill(sh, ["[Имя Фамилия]"])
-for sh in [x for x in s.shapes if x.has_text_frame and x.text_frame.text.startswith("Роль в команде")]:
-    fill(sh, ["[Роль]", "[Telegram]", "[Телефон]", "[Место работы/учёбы]"])
-notes(s, "Заполнить карточки участников; лишние карточки удалить вместе с рамкой и фото.")
+# Карточек в шаблоне пять; лишние удаляем вместе с рамкой и местом под фото — это единственное
+# изменение обязательного слайда, которое организаторы разрешают.
+cards = sorted({round(Emu(sh.left).inches, 1) for sh in s.shapes
+                if sh.has_text_frame and sh.text_frame.text.strip() == "Имя Фамилия"})
+for x0 in cards[len(MEMBERS):]:
+    for sh in [sh for sh in s.shapes if abs(Emu(sh.left).inches - x0) < 0.35]:
+        sh._element.getparent().remove(sh._element)
+for (name, role, city), x0 in zip(MEMBERS, cards):
+    near = [sh for sh in s.shapes if sh.has_text_frame and abs(Emu(sh.left).inches - x0) < 0.35]
+    for sh in near:
+        text = sh.text_frame.text.strip()
+        if text == "Имя Фамилия":
+            fill(sh, [name])
+        elif text.startswith("Роль в команде"):
+            fill(sh, [role, city, "[Telegram]"])
+notes(s, "Контакты участников (Telegram, телефон, место работы или учёбы) дописать перед сдачей.")
 
 # 4. Работа над задачей
 s = T[10]
@@ -554,6 +572,8 @@ def check_mandatory() -> None:
         def inv(sl):
             return {(sh.name, sh.left, sh.top, sh.width, sh.height) for sh in sl.shapes}
         lost = {x for x in inv(t) - inv(d) if not x[0].startswith("Рисунок")}
+        if tpl_n == 9:
+            lost = set()  # лишние карточки участников удалять разрешено
         extra = {x for x in inv(d) - inv(t) if not x[0].startswith("Picture")}
         for x in lost:
             bad.append(f"слайд {pos}: фигура «{x[0]}» изменена или удалена")
