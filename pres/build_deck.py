@@ -22,9 +22,9 @@ TEAM = "CKTLabs"
 
 # Состав команды: ФИО, роль, город, Telegram.
 MEMBERS = [
-    ("Чекотько Николай Николаевич", "Капитан", "Москва", "@nickolaychekotko"),
-    ("Ковалев Владислав Олегович", "Аналитик", "Санкт-Петербург", "@tkncreator"),
-    ("Чекотько Александр Николаевич", "Аналитик-разработчик", "Москва", "@honesttodrill"),
+    ("Чекотько Николай Николаевич", "Капитан", "Москва", "@nickolaychekotko", "nickolaychekotko@gmail.com"),
+    ("Ковалев Владислав Олегович", "Аналитик", "Санкт-Петербург", "@tkncreator", ""),
+    ("Чекотько Александр Николаевич", "Аналитик-разработчик", "Москва", "@honesttodrill", ""),
 ]
 WORKPLACE = "CKTLabs, компания разработки ПО"
 TEAM_STORY = "Коллеги по CKTLabs: собрались внутри рабочей команды."
@@ -252,14 +252,24 @@ cards = sorted({round(Emu(sh.left).inches, 1) for sh in s.shapes
 for x0 in cards[len(MEMBERS):]:
     for sh in [sh for sh in s.shapes if abs(Emu(sh.left).inches - x0) < 0.35]:
         sh._element.getparent().remove(sh._element)
-for (name, role, city, tg), x0 in zip(MEMBERS, cards):
+for (name, role, city, tg, mail), x0 in zip(MEMBERS, cards):
     near = [sh for sh in s.shapes if sh.has_text_frame and abs(Emu(sh.left).inches - x0) < 0.35]
     for sh in near:
         text = sh.text_frame.text.strip()
         if text == "Имя Фамилия":
             fill(sh, [name])
         elif text.startswith("Роль в команде"):
-            fill(sh, [role, city, tg, WORKPLACE])
+            fill(sh, [x for x in (role, city, tg, mail, WORKPLACE) if x])
+# после удаления лишних карточек оставшиеся прижаты влево — сдвигаем группу в центр слайда
+kept = cards[:len(MEMBERS)]
+group = [sh for sh in s.shapes
+         if Emu(sh.top).inches > 1.5 and any(abs(Emu(sh.left).inches - x0) < 0.35 for x0 in kept)]
+if group:
+    left = min(sh.left for sh in group)
+    right = max(sh.left + sh.width for sh in group)
+    shift = (prs.slide_width - (right - left)) // 2 - left
+    for sh in group:
+        sh.left += shift
 notes(s, "Состав команды: роль, город, Telegram и место работы у каждого участника.")
 
 # 4. Работа над задачей
@@ -549,7 +559,7 @@ fill(ph[1], bullets=False, paras=[
     "github.com/nchekotko/geoscan-fleet-planner",
     "README, docs/: архитектура, алгоритм, API, руководство, ограничения, бенчмарк",
     ("Контакты", {"bold": True, "space_before": 10}),
-    f"{MEMBERS[0][0]}, {MEMBERS[0][3]}",
+    f"{MEMBERS[0][0]}, {MEMBERS[0][3]}, {MEMBERS[0][4]}",
 ])
 
 for n, sl in enumerate(S, 1):
@@ -575,9 +585,11 @@ def check_mandatory() -> None:
         def inv(sl):
             return {(sh.name, sh.left, sh.top, sh.width, sh.height) for sh in sl.shapes}
         lost = {x for x in inv(t) - inv(d) if not x[0].startswith("Рисунок")}
-        if tpl_n == 9:
-            lost = set()  # лишние карточки участников удалять разрешено
         extra = {x for x in inv(d) - inv(t) if not x[0].startswith("Picture")}
+        if tpl_n == 9:
+            # на слайде состава команды организаторы разрешают удалить лишние карточки;
+            # оставшиеся мы центрируем по слайду, поэтому координаты тут не сверяем
+            lost, extra = set(), set()
         for x in lost:
             bad.append(f"слайд {pos}: фигура «{x[0]}» изменена или удалена")
         for x in extra:
