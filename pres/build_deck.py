@@ -18,14 +18,16 @@ HERE = Path(__file__).resolve().parent
 IMG = HERE / "img"
 OUT = HERE / "Geoscan_fleet_planner.pptx"
 
-TEAM = "[НАЗВАНИЕ КОМАНДЫ]"
+TEAM = "CKTLabs"
 
-# Состав команды: ФИО, роль, город. Контакты добавятся, когда участники их пришлют.
+# Состав команды: ФИО, роль, город, Telegram.
 MEMBERS = [
-    ("Чекотько Николай Николаевич", "Капитан", "Москва"),
-    ("Ковалев Владислав Олегович", "Аналитик", "Санкт-Петербург"),
-    ("Чекотько Александр Николаевич", "Аналитик-разработчик", "Москва"),
+    ("Чекотько Николай Николаевич", "Капитан", "Москва", "@nickolaychekotko"),
+    ("Ковалев Владислав Олегович", "Аналитик", "Санкт-Петербург", "@tkncreator"),
+    ("Чекотько Александр Николаевич", "Аналитик-разработчик", "Москва", "@honesttodrill"),
 ]
+WORKPLACE = "CKTLabs, компания разработки ПО"
+TEAM_STORY = "Коллеги по CKTLabs: собрались внутри рабочей команды."
 
 # Порядок слайдов: номера слайдов шаблона (1-based). Слайды 7–11 шаблона обязательны и идут
 # строго в исходном дизайне и на своих местах 7–11 (требование организаторов); остальные —
@@ -233,8 +235,8 @@ fill(find_tb(s, "Что делает"), [
 fill(find_tb(s, "Капитан"), [
     f"Капитан: {MEMBERS[0][0]}",
     f"Участников: {len(MEMBERS)} человека",
-    "Как образовалась команда: [заполнить]",
-    "Место работы / учёбы: [заполнить]",
+    "Как образовалась команда: коллеги по CKTLabs, собрались внутри рабочей команды",
+    f"Место работы / учёбы: {WORKPLACE}",
     "Город и регион: Москва и Санкт-Петербург",
 ])
 picture(s, 10, IMG / "demo_wide.jpg")
@@ -250,20 +252,21 @@ cards = sorted({round(Emu(sh.left).inches, 1) for sh in s.shapes
 for x0 in cards[len(MEMBERS):]:
     for sh in [sh for sh in s.shapes if abs(Emu(sh.left).inches - x0) < 0.35]:
         sh._element.getparent().remove(sh._element)
-for (name, role, city), x0 in zip(MEMBERS, cards):
+for (name, role, city, tg), x0 in zip(MEMBERS, cards):
     near = [sh for sh in s.shapes if sh.has_text_frame and abs(Emu(sh.left).inches - x0) < 0.35]
     for sh in near:
         text = sh.text_frame.text.strip()
         if text == "Имя Фамилия":
             fill(sh, [name])
         elif text.startswith("Роль в команде"):
-            fill(sh, [role, city, "[Telegram]"])
-notes(s, "Контакты участников (Telegram, телефон, место работы или учёбы) дописать перед сдачей.")
+            fill(sh, [role, city, tg, WORKPLACE])
+notes(s, "Состав команды: роль, город, Telegram и место работы у каждого участника.")
 
 # 4. Работа над задачей
 s = T[10]
 title(s, "КАК МЫ РАБОТАЛИ", pill=False)
-fill(shapes_by_ph(s)[27], ["[Как собрались, участвовали ли вместе в хакатонах — заполнить]"])
+fill(shapes_by_ph(s)[27], [f"{TEAM_STORY} Работаем над коммерческими продуктами, "
+                           "задача Геоскана легла на привычный для нас стек."])
 fill(find_tb(s, "Что вас вдохновило"), [
     "Один борт давно умеют планировать Geoscan Planner и Mission Planner. Распределять работу "
     "по разнородному парку с учётом заряда и ветра — нет. Это настоящая задача оптимизации.",
@@ -546,7 +549,7 @@ fill(ph[1], bullets=False, paras=[
     "github.com/nchekotko/geoscan-fleet-planner",
     "README, docs/: архитектура, алгоритм, API, руководство, ограничения, бенчмарк",
     ("Контакты", {"bold": True, "space_before": 10}),
-    "[капитан, Telegram]",
+    f"{MEMBERS[0][0]}, {MEMBERS[0][3]}",
 ])
 
 for n, sl in enumerate(S, 1):
