@@ -525,7 +525,7 @@ fill(ph[1], bullets=False, paras=[
     ("Запуск", {"bold": True}),
     "docker compose up --build → http://127.0.0.1:8000",
     ("Код и документация", {"bold": True, "space_before": 10}),
-    "[ссылка на репозиторий]",
+    "github.com/nchekotko/geoscan-fleet-planner",
     "README, docs/: архитектура, алгоритм, API, руководство, ограничения, бенчмарк",
     ("Контакты", {"bold": True, "space_before": 10}),
     "[капитан, Telegram]",
